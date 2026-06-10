@@ -251,34 +251,34 @@ async def _main() -> None:
 
     permission_mode = _resolve_permission_mode(args)
     model           = _build_model(args)
+
     session_id      = _resolve_session_id(args.resume)
 
     from agent import build_graph, make_initial_state
-    from session import get_checkpointer, make_thread_config, save_session
+    from session import get_checkpointer, make_thread_config, restore_session, save_session
     from ui import run_once, run_repl
 
-    config = make_thread_config(session_id)
+    config      = make_thread_config(session_id)
+    checkpointer = get_checkpointer()   # MemorySaver，无需 async with
+    builder     = build_graph(model, max_turns=args.max_turns)
+    app         = builder.compile(checkpointer=checkpointer)
 
-    async with get_checkpointer() as checkpointer:
-        builder = build_graph(model, max_turns=args.max_turns)
-        app     = builder.compile(checkpointer=checkpointer)
-
+    if args.resume is not None:
+        # 恢复旧会话：从 JSONL 注入消息历史
+        await restore_session(app, config, session_id)
+    else:
         # 新会话：写入初始 state
-        if args.resume is None:
-            await app.aupdate_state(config, make_initial_state(permission_mode))
+        await app.aupdate_state(config, make_initial_state(permission_mode))
 
-        save_session(session_id)
+    save_session(session_id)
 
-        try:
-            if args.prompt:
-                # 一次性模式
-                await run_once(app, config, model, args.prompt)
-            else:
-                # 交互 REPL
-                await run_repl(app, config, model)
-        finally:
-            # 会话结束：生成并保存标题
-            await _save_title(session_id, model, app, config)
+    try:
+        if args.prompt:
+            await run_once(app, config, model, args.prompt, session_id)
+        else:
+            await run_repl(app, config, model, session_id)
+    finally:
+        await _save_title(session_id, model, app, config)
 
 
 def main() -> None:

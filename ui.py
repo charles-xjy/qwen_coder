@@ -189,9 +189,49 @@ def _cmd_help() -> None:
         "  [cyan]/compact[/cyan]  立即压缩对话历史\n"
         "  [cyan]/memory[/cyan]   查看所有记忆\n"
         "  [cyan]/skills[/cyan]   查看可用 Skills\n"
+        "  [cyan]/resume[/cyan]   切换到历史会话\n"
         "  [cyan]/help[/cyan]     显示此帮助\n"
         "  [cyan]/exit[/cyan]     退出"
     )
+
+
+async def _cmd_resume(graph: Any, config: dict) -> "tuple[dict, str] | None":
+    """
+    显示历史会话列表，方向键选择后恢复到 graph。
+    返回 (new_config, new_session_id)，取消返回 None。
+    """
+    from session import list_sessions, restore_session, make_thread_config
+
+    sessions = list_sessions()
+    if not sessions:
+        console.print("[dim]暂无历史会话[/dim]")
+        return None
+
+    # 构建选项列表（最多显示 15 条）
+    display = sessions[:15]
+    labels: list[str] = []
+    for s in display:
+        updated = (s.get("last_updated", "")[:16]).replace("T", " ")
+        title   = (s.get("title") or "(无标题)")[:30]
+        sid     = s.get("id", "")[-12:]   # 只显示 ID 后缀
+        labels.append(f"{updated}  {title:<30}  …{sid}")
+    labels.append("[取消]")
+
+    idx = _arrow_select(labels, default=0)
+    if idx >= len(display):
+        console.print("[dim]已取消[/dim]")
+        return None
+
+    selected     = display[idx]
+    new_sid      = selected["id"]
+    new_config   = make_thread_config(new_sid)
+
+    with console.status("[cyan]恢复会话中…[/cyan]"):
+        await restore_session(graph, new_config, new_sid)
+
+    title = selected.get("title") or new_sid
+    console.print(f"[green]已切换到：{title}[/green]")
+    return new_config, new_sid
 
 
 async def handle_builtin_command(
@@ -199,10 +239,12 @@ async def handle_builtin_command(
     graph: Any,
     config: dict,
     model: Any,
-) -> bool:
+) -> "bool | tuple[dict, str]":
     """
     处理 /xxx 内置命令。
-    返回 True 表示已处理，REPL 不再将其发给 Agent。
+    返回 True  — 已处理，继续 REPL。
+    返回 False — 不是内置命令，发给 Agent。
+    返回 (new_config, new_session_id) — 会话已切换。
     """
     cmd = inp.strip().lower()
     if cmd == "/clear":
@@ -223,6 +265,9 @@ async def handle_builtin_command(
     if cmd in ("/help", "/?"):
         _cmd_help()
         return True
+    if cmd == "/resume":
+        result = await _cmd_resume(graph, config)
+        return result if result is not None else True
     return False
 
 
@@ -231,7 +276,8 @@ async def handle_builtin_command(
 async def stream_turn(
     graph: Any,
     config: dict,
-    input_data: Any,   # dict（新消息）或 Command（resume）
+    input_data: Any,        # dict（新消息）或 Command（resume）
+    session_id: str = "",
 ) -> None:
     """
     执行一轮 Agent 调用，处理：
@@ -323,93 +369,172 @@ async def stream_turn(
         _stop_spinner()
 
     # ── 处理 interrupt()（权限确认 / 压缩询问）───────────────────────────────
-    await _handle_interrupts(graph, config)
+    await _handle_interrupts(graph, config, session_id)
 
 
-async def _handle_interrupts(graph: Any, config: dict) -> None:
-    """检查图是否因 interrupt() 暂停，如是则提示用户并 resume。"""
+async def _handle_interrupts(graph: Any, config: dict, session_id: str = "") -> None:
+    """检查图是否因 interrupt() 暂停，弹出选择前先存档，然后 resume。"""
+    from session import save_turn
+
     while True:
         snap = await graph.aget_state(config)
         if not snap.tasks:
             break
 
-        # 取出所有 interrupt 值
         interrupts = []
         for task in snap.tasks:
             interrupts.extend(getattr(task, "interrupts", []))
         if not interrupts:
             break
 
+        # ── interrupt 弹出前先存档 ────────────────────────────────────────
+        # 此时已包含用户消息 + AI 的工具调用请求，崩溃也不丢
+        if session_id:
+            await save_turn(graph, config, session_id)
+
         for intr in interrupts:
             msg = intr.value if hasattr(intr, "value") else str(intr)
             console.print(f"\n[yellow]{escape(str(msg))}[/yellow]")
 
-            # 判断是压缩询问还是权限确认，给出对应提示
             msg_lower = str(msg).lower()
             if "压缩" in msg_lower or "compress" in msg_lower or "上下文" in msg_lower:
-                console.print("  [dim][compress] 立即压缩  [skip] 跳过[/dim]")
-                answer = _prompt_input("选择: ").strip() or "skip"
+                idx = _arrow_select(["立即压缩", "跳过"])
+                answer = "compress" if idx == 0 else "skip"
             else:
-                console.print("  [dim][yes] 允许  [no] 拒绝[/dim]")
-                answer = _prompt_input("选择: ").strip() or "no"
+                idx = _arrow_select(["允许", "拒绝", "跳过（取消此轮）"])
+                if idx == 0:
+                    answer = "yes"
+                elif idx == 1:
+                    answer = "no"
+                else:
+                    console.print("[dim]已跳过[/dim]")
+                    return
 
-        # resume 所有 interrupt（LangGraph 一次只有一个 interrupt 活跃）
-        await stream_turn(graph, config, Command(resume=answer))
+        await stream_turn(graph, config, Command(resume=answer), session_id)
         break
 
 
-# ── 用户输入 ──────────────────────────────────────────────────────────────────
+# ── 上下键选择 ────────────────────────────────────────────────────────────────
+
+def _arrow_select(options: list[str], default: int = 0) -> int:
+    """
+    终端上下键选择菜单，返回选中项的 index。
+    Windows 用 msvcrt，其他平台用 tty/termios。
+    Ctrl+C 返回最后一项（视为取消）。
+    """
+    import sys
+    current = default
+
+    def _render(first: bool = False) -> None:
+        if not first:
+            # 上移 len(options) 行，清掉之前的渲染
+            sys.stdout.write(f"\033[{len(options)}A")
+        for i, opt in enumerate(options):
+            if i == current:
+                sys.stdout.write(f"\r  \033[36m> {opt}\033[0m\n")
+            else:
+                sys.stdout.write(f"\r    {opt}\n")
+        sys.stdout.flush()
+
+    _render(first=True)
+
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            while True:
+                key = msvcrt.getch()
+                if key == b"\xe0":           # 方向键前缀
+                    key2 = msvcrt.getch()
+                    if key2 == b"H":         # 上
+                        current = (current - 1) % len(options)
+                        _render()
+                    elif key2 == b"P":       # 下
+                        current = (current + 1) % len(options)
+                        _render()
+                elif key == b"\r":           # Enter 确认
+                    sys.stdout.write("\n")
+                    return current
+                elif key == b"\x03":         # Ctrl+C
+                    raise KeyboardInterrupt
+        else:
+            import tty, termios
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch == "\x1b":
+                        sys.stdin.read(1)    # [
+                        arrow = sys.stdin.read(1)
+                        if arrow == "A":     # 上
+                            current = (current - 1) % len(options)
+                            _render()
+                        elif arrow == "B":   # 下
+                            current = (current + 1) % len(options)
+                            _render()
+                    elif ch in ("\r", "\n"):
+                        sys.stdout.write("\n")
+                        return current
+                    elif ch == "\x03":
+                        raise KeyboardInterrupt
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        return len(options) - 1   # 默认选最后一项（取消）
+
+
+# ── 普通文本输入 ──────────────────────────────────────────────────────────────
 
 def _prompt_input(prompt_str: str = "") -> str:
-    """封装 input()，便于后续替换为 prompt_toolkit。"""
     try:
         return input(prompt_str)
-    except (EOFError, KeyboardInterrupt):
-        return ""
+    except EOFError:
+        return "/exit"
+    except KeyboardInterrupt:
+        raise   # 交给上层处理
 
 
 # ── REPL 主循环 ───────────────────────────────────────────────────────────────
 
-async def run_repl(graph: Any, config: dict, model: Any) -> None:
+async def run_repl(graph: Any, config: dict, model: Any, session_id: str = "") -> None:
     """
     交互式 REPL。
-    Ctrl+C 中断当前操作，再次 Ctrl+C 退出。
+    /exit 或 Ctrl+C 退出。每轮结束后自动保存消息到 JSONL。
     """
+    from session import save_turn
+
     console.print(
         Panel(
             "[bold cyan]qwen-coder[/bold cyan]  AI 编程助手\n"
-            "[dim]输入 /help 查看内置命令，Ctrl+C 中断，再次 Ctrl+C 退出[/dim]",
+            "[dim]/exit 退出  /help 帮助  Ctrl+C 中断当前操作[/dim]",
             border_style="cyan",
         )
     )
 
-    _ctrl_c_count = 0
-
     while True:
         try:
             user_input = _prompt_input("\n[你] ").strip()
-            _ctrl_c_count = 0
         except KeyboardInterrupt:
-            _ctrl_c_count += 1
-            if _ctrl_c_count >= 2:
-                console.print("\n[dim]再见[/dim]")
-                break
-            console.print("\n[dim]再按一次 Ctrl+C 退出[/dim]")
+            console.print("\n[dim]已中断（输入 /exit 退出）[/dim]")
             continue
 
         if not user_input:
             continue
 
-        if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
+        if user_input.lower() in ("/exit", "/quit", "exit", "quit", "q"):
             console.print("[dim]再见[/dim]")
             break
 
         # 内置命令
         if user_input.startswith("/"):
-            handled = await handle_builtin_command(user_input, graph, config, model)
-            if handled:
+            result = await handle_builtin_command(user_input, graph, config, model)
+            if isinstance(result, tuple):
+                config, session_id = result   # 会话已切换，更新本地变量
+            if result is not False:
                 continue
-            # 不是内置命令，可能是 skill，直接发给 Agent
 
         # 发给 Agent
         try:
@@ -417,26 +542,36 @@ async def run_repl(graph: Any, config: dict, model: Any) -> None:
                 graph,
                 config,
                 {"messages": [HumanMessage(content=user_input)]},
+                session_id,
             )
         except KeyboardInterrupt:
             console.print("\n[yellow]已中断[/yellow]")
 
+        # 每轮结束后存档（补充：覆盖 interrupt 前存的，包含完整结果）
+        if session_id:
+            await save_turn(graph, config, session_id)
+
 
 # ── 一次性执行模式 ────────────────────────────────────────────────────────────
 
-async def run_once(graph: Any, config: dict, model: Any, prompt: str) -> None:
+async def run_once(graph: Any, config: dict, model: Any, prompt: str, session_id: str = "") -> None:
     """
     非交互式：执行一次 prompt，输出完整结果后退出。
     用于 `qwen-coder "帮我写一个快速排序"` 这种命令行调用。
     """
+    from session import save_turn
     try:
         await stream_turn(
             graph,
             config,
             {"messages": [HumanMessage(content=prompt)]},
+            session_id,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]已中断[/yellow]")
+
+    if session_id:
+        await save_turn(graph, config, session_id)
 
     # 打印 token 统计
     state = (await graph.aget_state(config)).values

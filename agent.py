@@ -96,7 +96,7 @@ def build_graph(model: Any, max_turns: int = 100):
         lc_tools = _to_lc_tools(tool_schemas)
         bound_model = model.bind_tools(lc_tools) if lc_tools else model
 
-        # 构建 system prompt（含 sideQuery 记忆注入）
+        # 构建 system prompt（sideQuery 选出相关记忆注入）
         user_text = _last_human_text(state["messages"])
         prompt, newly_surfaced, bytes_added = await build_system_prompt(
             state, model, user_text
@@ -114,14 +114,14 @@ def build_graph(model: Any, max_turns: int = 100):
         output_tokens = usage.get("output_tokens", 0)
 
         return {
-            "messages":             [response],
-            "current_turns":        turns + 1,
-            "last_api_call_time":   time.time(),
+            "messages":               [response],
+            "current_turns":          turns + 1,
+            "last_api_call_time":     time.time(),
             "last_input_token_count": input_tokens,
-            "total_input_tokens":   (state.get("total_input_tokens")  or 0) + input_tokens,
-            "total_output_tokens":  (state.get("total_output_tokens") or 0) + output_tokens,
-            "surfaced_memories":    (state.get("surfaced_memories")   or set()) | newly_surfaced,
-            "session_memory_bytes": (state.get("session_memory_bytes") or 0) + bytes_added,
+            "total_input_tokens":     (state.get("total_input_tokens")  or 0) + input_tokens,
+            "total_output_tokens":    (state.get("total_output_tokens") or 0) + output_tokens,
+            "surfaced_memories":      (state.get("surfaced_memories")   or set()) | newly_surfaced,
+            "session_memory_bytes":   (state.get("session_memory_bytes") or 0) + bytes_added,
         }
 
     # ── tools 节点 ───────────────────────────────────────────────────────────

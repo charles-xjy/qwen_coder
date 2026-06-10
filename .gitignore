@@ -1,0 +1,6 @@
+.memory/
+.sessions/
+__pycache__/
+*.pyc
+*.egg-info/
+.idea/

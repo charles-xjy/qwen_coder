@@ -62,13 +62,21 @@ class SandboxManager:
 
         # 执行命令（不在锁内，允许并发只读）
         try:
+            from opensandbox.models.execd import RunCommandOpts
             result = await self._sandbox.commands.run(
                 command,
-                timeout=timedelta(seconds=timeout + 5),
+                opts=RunCommandOpts(
+                    working_directory="/workspace",
+                    timeout=timedelta(seconds=timeout + 5),
+                ),
             )
-            stdout = "".join(x.text for x in result.logs.stdout)
-            stderr = "".join(x.text for x in result.logs.stderr)
-            exit_code = result.exit_code
+            stdout = getattr(result, "stdout", "") or ""
+            stderr = getattr(result, "stderr", "") or ""
+            exit_code = getattr(result, "exit_code", 0) or 0
+            # 兼容不同版本的返回结构
+            if hasattr(result, "logs"):
+                stdout = "".join(x.text for x in (result.logs.stdout or []))
+                stderr = "".join(x.text for x in (result.logs.stderr or []))
 
             parts = []
             if stdout:
@@ -145,14 +153,15 @@ class SandboxManager:
         """沙箱首次启动后的初始化：创建工作目录、设置 python 软链。"""
         if self._initialized:
             return
+        from opensandbox.models.execd import RunCommandOpts
+        init_opts = RunCommandOpts(timeout=timedelta(seconds=10))
         cmds = [
             "mkdir -p /workspace",
-            # 兼容 python 命令（镜像内只有 python3）
-            "ln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true",
+            "ln -sf $(which python3) /usr/local/bin/python 2>/dev/null || true",
         ]
         for cmd in cmds:
             try:
-                await self._sandbox.commands.run(cmd, timeout=timedelta(seconds=10))
+                await self._sandbox.commands.run(cmd, opts=init_opts)
             except Exception:
                 pass
         self._initialized = True

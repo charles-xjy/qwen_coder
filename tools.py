@@ -95,6 +95,7 @@ _TOOL_LEVELS: dict[str, str] = {
     "list_files":      "safe",
     "grep_search":     "safe",
     "web_fetch":       "safe",
+    "save_memory":     "safe",
     "write_file":      "write",
     "edit_file":       "write",
     "run_shell":       "exec",
@@ -211,8 +212,8 @@ async def _handle_edit_file(path: str, old_string: str, new_string: str) -> str:
 
         # 规范化引号（处理智能引号）
         def normalize(s: str) -> str:
-            return s.replace("‘", "'").replace("’", "'") \
-                    .replace("“", '"').replace("”", '"')
+            return s.replace("'", "'").replace("'", "'") \
+                    .replace(""", '"').replace(""", '"')
 
         content = p.read_text(encoding="utf-8", errors="replace")
         old_norm = normalize(old_string)
@@ -336,6 +337,22 @@ async def _handle_web_fetch(url: str, prompt: str = "") -> str:
         return f"Error: {e}"
 
 
+
+async def _handle_save_memory(
+    name: str,
+    description: str,
+    mem_type: str,
+    content: str,
+) -> str:
+    """保存一条长期记忆。"""
+    try:
+        from memory import save_memory
+        path = save_memory(name, description, mem_type, content)
+        return f"记忆已保存：{path.name}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 async def _handle_run_shell(command: str, timeout: int = 30) -> str:
     """通过 OpenSandbox 在沙箱中执行命令，详见 sandbox.py。"""
     try:
@@ -352,6 +369,7 @@ async def _handle_enter_plan_mode() -> str:
 
 async def _handle_exit_plan_mode() -> str:
     return "__exit_plan_mode__"
+
 
 
 # ── 工具 schema 定义（供 LLM binding）────────────────────────────────────────
@@ -463,6 +481,26 @@ _CORE_TOOLS: list[dict] = [
         "deferred": False,
     },
     {
+        "name": "save_memory",
+        "description": (
+            "保存一条长期记忆到文件系统，供未来会话使用。"
+            "适合保存：用户偏好（user）、工作方式反馈（feedback）、项目决策（project）、外部资源位置（reference）。"
+            "不要保存可从代码直接读取的内容。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name":        {"type": "string", "description": "记忆名称（简短，用于索引展示）"},
+                "description": {"type": "string", "description": "一句话描述这条记忆的内容"},
+                "mem_type":    {"type": "string", "enum": ["user", "feedback", "project", "reference"],
+                                "description": "记忆类型"},
+                "content":     {"type": "string", "description": "记忆正文（Markdown 格式）"},
+            },
+            "required": ["name", "description", "mem_type", "content"],
+        },
+        "deferred": False,
+    },
+    {
         "name": "enter_plan_mode",
         "description": (
             "切换到只读规划模式（plan）。此后所有写操作和 shell 执行均被拒绝，"
@@ -565,6 +603,7 @@ _HANDLERS: dict[str, Any] = {
     "list_files":      _handle_list_files,
     "grep_search":     _handle_grep_search,
     "web_fetch":       _handle_web_fetch,
+    "save_memory":     _handle_save_memory,
     "run_shell":       _handle_run_shell,
     "enter_plan_mode": _handle_enter_plan_mode,
     "exit_plan_mode":  _handle_exit_plan_mode,

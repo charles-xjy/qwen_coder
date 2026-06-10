@@ -40,8 +40,5 @@ class AgentState(TypedDict):
     compress_choice: str
 
     # ── 记忆系统 ──────────────────────────────────────────────────────────────
-    # 本会话已注入的记忆文件名集合，避免重复 sideQuery 和重复注入
     surfaced_memories: Set[str]
-
-    # 本会话已注入的记忆总字节数，上限 60KB
     session_memory_bytes: int

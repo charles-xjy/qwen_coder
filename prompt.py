@@ -15,12 +15,14 @@ prompt.py - 系统 Prompt 构建
 
 import os
 import platform
+import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from skills import build_skill_catalog
-from memory import get_memories_for_prompt
+from memory import get_memories_for_prompt, load_memory_index
 from state import AgentState
 
 # ── 核心身份 ──────────────────────────────────────────────────────────────────
@@ -108,6 +110,55 @@ def _get_env_section() -> str:
     )
 
 
+# ── Git 上下文 ───────────────────────────────────────────────────────────────
+
+def _get_git_context() -> str:
+    """获取当前 git 状态：分支、最近 3 条 commit、工作区变更摘要。"""
+    try:
+        def _run(cmd: list[str]) -> str:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() if r.returncode == 0 else ""
+
+        branch  = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if not branch:
+            return ""
+
+        log     = _run(["git", "log", "--oneline", "-3"])
+        status  = _run(["git", "status", "--short"])
+
+        lines = [f"【Git】分支：{branch}"]
+        if log:
+            lines.append("最近提交：\n" + "\n".join(f"  {l}" for l in log.splitlines()))
+        if status:
+            lines.append("工作区变更：\n" + "\n".join(f"  {l}" for l in status.splitlines()[:20]))
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+# ── CLAUDE.md ────────────────────────────────────────────────────────────────
+
+def _load_claude_md() -> str:
+    """按优先级加载 CLAUDE.md：项目根 > 父目录（最多向上 3 层）> ~/.claude/CLAUDE.md。"""
+    candidates: list[Path] = []
+
+    cwd = Path.cwd()
+    for p in [cwd, *cwd.parents[:3]]:
+        candidates.append(p / "CLAUDE.md")
+
+    candidates.append(Path.home() / ".claude" / "CLAUDE.md")
+
+    for path in candidates:
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    return f"【项目说明 ({path})】\n{content[:8000]}"
+            except Exception:
+                continue
+    return ""
+
+
 # ── 工具使用规则 ──────────────────────────────────────────────────────────────
 
 _TOOL_RULES = """\
@@ -132,37 +183,38 @@ _PLAN_MODE_EXTRA = """\
 """
 
 
-# ── 主构建函数（async，含记忆注入）──────────────────────────────────────────
+# ── 主构建函数（async，含 sideQuery 记忆注入）────────────────────────────────
 
 async def build_system_prompt(
     state: AgentState,
     model: Any,
     user_message: str = "",
-) -> str:
+) -> tuple[str, set, int]:
     """
-    构建完整 system prompt，含异步 sideQuery 记忆注入。
-    返回 (prompt_str, updated_state_patch) — state_patch 包含新增的 surfaced_memories 和 bytes。
-
-    调用方负责将 state_patch 合并回 state。
+    构建完整 system prompt。
+    返回 (prompt_str, newly_surfaced_filenames, bytes_added)。
     """
     sections: list[str] = []
 
-    # 1. 身份
     sections.append(_IDENTITY)
-
-    # 2. 环境
     sections.append(_get_env_section())
 
-    # 3. 权限模式
+    git_ctx = _get_git_context()
+    if git_ctx:
+        sections.append(git_ctx)
+
+    claude_md = _load_claude_md()
+    if claude_md:
+        sections.append(claude_md)
+
     mode = state.get("permission_mode", "default")
     sections.append(_get_permission_section(mode))
     if mode == "plan":
         sections.append(_PLAN_MODE_EXTRA)
 
-    # 4. 工具规则
     sections.append(_TOOL_RULES)
 
-    # 5. 记忆注入（sideQuery）
+    # sideQuery：让小模型从索引中选出相关记忆，注入完整内容
     already_surfaced: set[str] = state.get("surfaced_memories", set()) or set()
     session_bytes: int = state.get("session_memory_bytes", 0) or 0
 
@@ -179,13 +231,11 @@ async def build_system_prompt(
         newly_surfaced = set()
         bytes_added = 0
 
-    # 6. Skills 目录
     skill_catalog = build_skill_catalog()
     if skill_catalog:
         sections.append(skill_catalog)
 
-    prompt = "\n\n".join(sections)
-    return prompt, newly_surfaced, bytes_added
+    return "\n\n".join(sections), newly_surfaced, bytes_added
 
 
 def build_system_prompt_sync(state: AgentState) -> str:
@@ -196,6 +246,14 @@ def build_system_prompt_sync(state: AgentState) -> str:
 
     sections.append(_IDENTITY)
     sections.append(_get_env_section())
+
+    git_ctx = _get_git_context()
+    if git_ctx:
+        sections.append(git_ctx)
+
+    claude_md = _load_claude_md()
+    if claude_md:
+        sections.append(claude_md)
 
     mode = state.get("permission_mode", "default")
     sections.append(_get_permission_section(mode))

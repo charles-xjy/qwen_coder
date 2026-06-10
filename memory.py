@@ -13,7 +13,6 @@ memory.py - 文件记忆系统
 大小限制：单文件注入 4KB，单会话注入总量 60KB
 """
 
-import hashlib
 import json
 import re
 import time
@@ -40,9 +39,8 @@ _SIDE_QUERY_TOP_K  = 5      # sideQuery 最多选取条数
 # ── 路径 ──────────────────────────────────────────────────────────────────────
 
 def _memory_dir() -> Path:
-    """当前项目的记忆目录，按 WORKDIR 哈希隔离不同项目。"""
-    project_hash = hashlib.md5(str(WORKDIR).encode()).hexdigest()[:12]
-    d = Path.home() / ".qwen-coder" / "projects" / project_hash / "memory"
+    """记忆目录：项目根目录下的 .memory/，随项目一起版本控制。"""
+    d = WORKDIR / ".memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
