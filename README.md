@@ -14,6 +14,26 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ---
 
+## 核心亮点
+
+### 1. 动态子 Agent 分发与 Skills 系统
+
+基于 LangGraph 实现子 Agent 系统，支持 explore / plan / general 三种内置类型及 `.claude/agents/*.md` 自定义 Agent，context 完全隔离、工具集按类型静态限制。配套 Skills 渐进式加载机制，通过 SKILL.md frontmatter 声明触发条件和执行模式（inline / fork），Agent 可按需自动调用。自定义 Agent 和 Skill 均支持 `allowed-tools` 字段声明工具白名单。
+
+### 2. 异步记忆检索（SideQuery）
+
+文件系统记忆存储（`~/.qwen-coder/projects/{hash}/memory/`），Markdown + YAML frontmatter，支持 user / feedback / project / reference 四种类型。SideQuery 后台异步让 LLM 从 MEMORY.md 索引中选取 Top-5 相关记忆注入 system prompt，不阻塞主 Agent 循环，配合 `recentTools` 过滤和 `max_tokens=256` 约束，单会话注入量控制在 60KB 以内。
+
+### 3. 四级上下文压缩与 Token 管理
+
+递进式压缩策略，遵循「先丢可再生资源，最后才动不可再生内容」原则：预算截断（单结果 >15KB）→ Snipping（使用率 >60%，id-in-place 替换旧工具结果为占位符）→ Micro-compact（空闲 >5 分钟，清空所有旧 ToolMessage）→ LLM 结构化摘要（使用率 >85% 且用户确认，早期对话压缩为任务背景/已完成工作/关键决策/当前状态/待续事项）。全程追踪从首 token 到当轮的 token 消耗，结合 Prompt Caching（`cache_control: {type: "ephemeral"}` 稳定/动态前缀分离）将缓存命中成本降至 0.1×。
+
+### 4. 远程沙箱安全执行
+
+集成 OpenSandbox 远程容器，会话级单例管理，文件增量同步（mtime 比对，仅上传变更），已安装包和环境变量在多次调用间保留。危险命令正则拦截（rm -rf / sudo / curl | bash 等 15+ 模式），权限系统支持 5 种模式（default / plan / acceptEdits / bypassPermissions / dontAsk），可通过 `settings.json` 按工具名和路径前缀配置白名单。沙箱不可用时自动询问用户降级到本地执行。
+
+---
+
 ## 功能特性
 
 ### 一、Agent 循环
@@ -231,23 +251,24 @@ uvx opensandbox-server
 
 ### 十、Prompt Caching（减少重复 token 消耗）
 
-system prompt 每轮都会重建，但其中大部分内容在会话期间保持不变。本项目将 system prompt 拆分为**稳定前缀**和**动态后缀**，利用 provider 的 prompt caching 机制减少 input token 费用。
+system prompt 每轮都会重建，只有真正不变的内容才放入稳定前缀，会变的内容全部移入动态后缀，利用 provider 的 prompt caching 机制减少 input token 费用。
 
 **Section 顺序设计：**
 
 ```
-稳定前缀（会话期间不变）            动态后缀（每轮可能变化）
-─────────────────────────         ─────────────────────────────
-  _IDENTITY                           git context
-  env section（无时间戳）              memories（sideQuery 每轮结果）
-  CLAUDE.md                           skills catalog
-  permission section
-  _TOOL_RULES
+稳定前缀（会话期间绝对不变）          动态后缀（随环境/模式/轮次变化）
+─────────────────────────           ─────────────────────────────
+  _IDENTITY                             env section（含 cwd，可能变化）
+  _TOOL_RULES                           CLAUDE.md（agent 可能编辑它）
+                                        permission section（进入/退出 plan 会变化）
+                                        git context
+                                        memories（sideQuery 每轮结果）
+                                        skills catalog
 ```
 
-env section 包含操作系统、Shell、工作目录、Python 版本，去掉了时间戳（精确到分钟的时间对编程任务没有实际用处，却会每分钟破坏一次缓存）。去掉后整个 env section 在会话期间完全不变，可以进稳定前缀。
+稳定区只保留两个硬编码常量，env / CLAUDE.md / permission 虽然大部分时间不变，但 cwd 切换、agent 编辑 CLAUDE.md、进入 plan 模式都会导致变化，放入稳定区会导致缓存频繁失效。移到动态区后，缓存只在 _IDENTITY 或 _TOOL_RULES 代码变更时才失效，命中率大幅提升。
 
-语义上最自然的顺序应该是 `_IDENTITY → CLAUDE.md → memories → permission → tool_rules → env`——先身份、再项目背景、再长期记忆、最后才是规则和环境。但 **memories 必须放在动态后缀**，因为 sideQuery 每轮根据用户输入动态选取不同的记忆文件注入，内容每轮都变，放入稳定前缀会导致缓存每轮失效。注意 `MEMORY.md`（索引文件）本身不会注入 prompt，只是 sideQuery 内部用来筛选文件名的；真正注入的是被选中的那几条记忆的完整 Markdown 内容，那部分才是动态的。当前顺序是为缓存命中率向语义顺序妥协的结果。
+消息层同样对齐 Claude Code 官方实现：每条请求在 messages 最后一条消息上打 1 个 `cache_control` 标记（`markerIndex = messages.length - 1`），加上 system prompt 稳定段的 1 个标记，总共 2 个标记。
 
 **Anthropic 后端（显式缓存）：**
 
