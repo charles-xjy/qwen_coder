@@ -268,7 +268,7 @@ def build_graph(model: Any, max_turns: int = 100):
     async def _run_tool(name: str, args: dict, state: AgentState) -> str:
         if name == "agent":
             return await handle_agent_tool(
-                agent_type=args.get("agent_type", "general"),
+                agent_type=args.get("type", "general"),
                 prompt=args.get("prompt", ""),
                 description=args.get("description", ""),
                 model=model,

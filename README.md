@@ -16,9 +16,9 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ## 核心亮点
 
-### 1. 动态子 Agent 分发与 Skills 系统
+### 1. 基于 SubagentConfig 的子 Agent 系统
 
-基于 LangGraph 实现子 Agent 系统，支持 explore / plan / general 三种内置类型及 `.claude/agents/*.md` 自定义 Agent，context 完全隔离、工具集按类型静态限制。配套 Skills 渐进式加载机制，通过 SKILL.md frontmatter 声明触发条件和执行模式（inline / fork），Agent 可按需自动调用。自定义 Agent 和 Skill 均支持 `allowed-tools` 字段声明工具白名单。
+对齐 [cc-haha](https://github.com/NanmiCoder/cc-haha) / [Deer Flow](https://github.com/bytedance/deer-flow) 的配置模型，通过 `SubagentConfig` 数据类统一管理子 Agent 定义——所有 Agent（含内置 explore/plan/general）均为 `agents/*.md` 文件，零硬编码。支持 `allowed-tools` / `disallowed-tools` 双轴工具控制、`skills` 按需注入（`<skill>` 标签嵌入 system prompt）、`permission-mode` 显式指定权限（否则三级继承：config → 父 plan → bypassPermissions）、`timeout-seconds` wall-clock 超时。三层加载优先级：包内置 → `~/.claude/agents/` → `./.claude/agents/`，后层覆盖前层。配套 Skills 渐进式加载机制，通过 SKILL.md frontmatter 声明触发条件和执行模式（inline / fork），Agent 可按需自动调用。
 
 ### 2. 异步记忆检索（SideQuery）
 
@@ -207,14 +207,69 @@ LLM 摘要失败时自动降级为 Snipping。
 
 ### 七、子 Agent 系统
 
-- 通过 `agent` 工具派发，父 Agent 以字符串形式接收子 Agent 结论
-- 三种内置类型，工具集按类型静态限制：
-  - `explore`：只有 `read_file` / `list_files` / `grep_search`，专为代码探索优化
-  - `plan`：只读工具，输出实现方案
-  - `general`：全部工具（排除 `agent` 自身，防无限递归）
-- 自定义类型：在 `.claude/agents/*.md` 中定义，frontmatter 指定 `allowed-tools`
-- 权限继承：父为 `plan` 则子也为 `plan`；否则子用 `bypassPermissions`
-- context 完全隔离：子 Agent 有独立消息历史，不污染父 Agent context window
+所有子 Agent 统一通过 `.md` 文件定义（零硬编码），`SubagentConfig` 数据类对齐 cc-haha / Deer Flow 的配置模型。
+
+**配置模型：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | `str` | 唯一标识，对应 `agent` 工具的 `type` 参数 |
+| `description` | `str` | 告诉主 Agent 此子 Agent 适合什么场景 |
+| `system_prompt` | `str` | 子 Agent 的 SystemMessage（`.md` 正文） |
+| `allowed-tools` | `list[str]` | 工具白名单，空 = 继承全量 |
+| `disallowed-tools` | `list[str]` | 工具黑名单，未声明 = 默认 `[agent, enter_plan_mode, exit_plan_mode]` |
+| `skills` | `list[str]` | 注入的 skill 名称列表，空 = 不注入 |
+| `permission-mode` | `str` | 权限模式，空 = 继承父级 |
+| `model` | `str` | `"inherit"` = 沿用父级模型 |
+| `max-turns` | `int` | 最大交互轮次，默认 50 |
+| `timeout-seconds` | `int` | 最大 wall-clock 执行时间，默认 900 |
+
+**三层加载优先级（后覆盖前）：**
+
+```
+agents/                  ← 包内置（explore / plan / general）
+~/.claude/agents/        ← 用户级
+./.claude/agents/        ← 项目级，最高优先级
+```
+
+**权限解析（三级优先级）：**
+
+```
+config.permission_mode 显式指定？ → 使用该模式
+父为 plan？                      → 子也用 plan（只读）
+默认                             → bypassPermissions
+```
+
+**三种内置类型：**
+
+- `explore`：白名单 `[read_file, list_files, grep_search]`，max_turns=30，专为代码探索优化
+- `plan`：白名单 `[read_file, list_files, grep_search]`，max_turns=30，输出结构化实现方案
+- `general`：白名单为空（继承全量），黑名单 `[agent, enter_plan_mode, exit_plan_mode]`，max_turns=50
+
+**新增一个 Agent 只需写 `.md` 文件，无需改代码：**
+
+```markdown
+---
+name: code-reviewer
+description: 代码审查专家，检查代码质量和潜在 bug
+allowed-tools: read_file, grep_search, write_file
+disallowed-tools:
+skills: code-review
+permission-mode: bypassPermissions
+model: inherit
+max-turns: 20
+timeout-seconds: 600
+---
+你是代码审查专家...
+
+<guidelines>
+- 先用 read_file 阅读代码
+- 用 grep_search 查找相关模式
+- 审查结果写入 review.md
+</guidelines>
+```
+
+写完即可用 `agent(type="code-reviewer", prompt="...")` 调用。
 
 ### 八、沙箱隔离（OpenSandbox）
 
@@ -394,7 +449,8 @@ qwen_coder/
 ├── agent.py         # LangGraph StateGraph 定义，节点逻辑，路由函数
 ├── tools.py         # 10 工具定义 + 权限检查 + deferred 机制 + execute_tool()
 ├── sandbox.py       # OpenSandbox 会话级单例，文件上传同步，降级策略
-├── subagent.py      # agent 工具，子 Agent 实例化，类型配置
+├── subagent.py      # SubagentConfig 配置模型 + 轻量 for-loop 执行引擎
+├── agents/          # 子 Agent 定义（.md 文件，包内置为 explore/plan/general）
 ├── memory.py        # 文件记忆读写，MEMORY.md 索引，sideQuery 检索
 ├── skills.py        # SKILL.md 加载，/cmd 解析，prompt 注入
 ├── session.py       # 会话 JSON 索引，LangGraph checkpointer 封装
@@ -497,6 +553,7 @@ uvx opensandbox-server
 
 ## 近期更新
 
+- 2026-06-11：子 Agent 系统重构 — 引入 `SubagentConfig` 数据类对齐 cc-haha/Deer Flow，所有 Agent 统一为 `agents/*.md` 文件定义（零硬编码），新增 `disallowed-tools` / `skills` / `permission-mode` / `timeout-seconds` 字段，三层加载优先级（包内置 → 用户 → 项目）
 - 2026-06-11：优化Prompt Caching逻辑，完全对齐Claude Code官方实现，支持对话历史增量缓存，缓存命中率提升40%+
 - 2026-06-11：修复会话恢复功能，新增`as_node="agent"`参数解决状态更新异常问题
 - 2026-06-11：新增便捷启动脚本`run.sh`，预置Qwen后端配置，开箱即用
