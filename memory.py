@@ -243,10 +243,12 @@ async def select_relevant_memories(
     query: str,
     model: Any,
     already_surfaced: set[str],
+    recent_tools: list[str] | None = None,
 ) -> list[RelevantMemory]:
     """
-    将 MEMORY.md 索引发给 LLM，让它选出与 query 最相关的 ≤5 条记忆。
+    将记忆 manifest 发给 LLM，让它选出与 query 最相关的 ≤5 条记忆。
     已在本会话注入过的记忆（already_surfaced）不重复注入。
+    recent_tools：本轮已调用的工具名，跳过这些工具的 reference 文档。
 
     返回完整加载的 RelevantMemory 列表，可直接注入 system prompt。
     """
@@ -265,21 +267,32 @@ async def select_relevant_memories(
         manifest_lines.append(f"- {h.filename}: {h.description} [类型: {h.type}]")
     manifest = "\n".join(manifest_lines)
 
+    # recentTools 过滤说明
+    recent_tools_section = ""
+    if recent_tools:
+        tools_str = ", ".join(recent_tools)
+        recent_tools_section = (
+            f"\n本轮已使用的工具：{tools_str}。"
+            "不要选择这些工具的 reference 类型文档——对话历史中已有使用示例，注入会造成冗余。\n"
+        )
+
     prompt = (
-        f"用户当前的查询/任务：\n{query}\n\n"
+        f"用户当前的查询/任务：\n{query}\n"
+        f"{recent_tools_section}\n"
         f"可用记忆列表：\n{manifest}\n\n"
-        f"请从上述列表中选出最相关的记忆文件名（最多 {_SIDE_QUERY_TOP_K} 个）。\n"
-        "只返回 JSON，格式：{\"selected\": [\"filename1.md\", \"filename2.md\"]}\n"
-        "如果没有相关记忆，返回：{\"selected\": []}"
+        f"从上述列表中选出最相关的记忆文件名（最多 {_SIDE_QUERY_TOP_K} 个）。\n"
+        '只返回 JSON，不加任何解释，格式：{"selected": ["filename1.md", "filename2.md"]}\n'
+        '没有相关记忆则返回：{"selected": []}'
     )
 
     try:
         from langchain_core.messages import HumanMessage
-        response = await model.ainvoke([HumanMessage(content=prompt)])
+        # max_tokens=256 足够输出 5 个文件名的 JSON，避免模型输出冗余文字
+        response = await model.bind(max_tokens=256).ainvoke([HumanMessage(content=prompt)])
         raw = response.content.strip()
 
         # 提取 JSON（兼容 LLM 在 JSON 前后加说明文字的情况）
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        match = re.search(r"\{[^{}]*\}", raw)
         if not match:
             return []
         selected_names: list[str] = json.loads(match.group())["selected"]
@@ -323,6 +336,7 @@ async def get_memories_for_prompt(
     model: Any,
     already_surfaced: set[str],
     session_bytes_used: int,
+    recent_tools: list[str] | None = None,
 ) -> tuple[str, set[str], int]:
     """
     主入口：检索相关记忆，返回可直接拼接到 system prompt 的字符串。
@@ -338,7 +352,7 @@ async def get_memories_for_prompt(
     if session_bytes_used >= _MAX_SESSION_BYTES:
         return "", set(), 0
 
-    memories = await select_relevant_memories(query, model, already_surfaced)
+    memories = await select_relevant_memories(query, model, already_surfaced, recent_tools)
     if not memories:
         return "", set(), 0
 

@@ -183,38 +183,60 @@ _PLAN_MODE_EXTRA = """\
 """
 
 
+# ── Prompt Cache 辅助 ─────────────────────────────────────────────────────────
+
+def _is_anthropic_model(model: Any) -> bool:
+    """检测是否为 ChatAnthropic，用于决定是否注入 cache_control。"""
+    return type(model).__module__.startswith("langchain_anthropic")
+
+
+def _join(*parts: str) -> str:
+    return "\n\n".join(p for p in parts if p)
+
+
 # ── 主构建函数（async，含 sideQuery 记忆注入）────────────────────────────────
 
 async def build_system_prompt(
     state: AgentState,
     model: Any,
     user_message: str = "",
-) -> tuple[str, set, int]:
+    recent_tools: list[str] | None = None,
+) -> tuple[str | list, set, int]:
     """
     构建完整 system prompt。
-    返回 (prompt_str, newly_surfaced_filenames, bytes_added)。
+    返回 (prompt_content, newly_surfaced_filenames, bytes_added)。
+
+    prompt_content 类型：
+      - Anthropic 模型：list[dict]，稳定前缀带 cache_control ephemeral
+      - 其他模型：str，稳定内容置前（利于 OpenAI/Qwen 自动前缀缓存）
+
+    Section 顺序设计：
+      稳定前缀（跨轮次内容不变）：identity → CLAUDE.md → permission → tool_rules
+      动态后缀（含时间戳/每轮变化）：env → git → memories → skills
     """
-    sections: list[str] = []
+    mode = state.get("permission_mode", "default")
 
-    sections.append(_IDENTITY)
-    sections.append(_get_env_section())
-
-    git_ctx = _get_git_context()
-    if git_ctx:
-        sections.append(git_ctx)
+    # ── 稳定前缀（可缓存）────────────────────────────────────────────────────
+    stable_parts: list[str] = [_IDENTITY]
 
     claude_md = _load_claude_md()
     if claude_md:
-        sections.append(claude_md)
+        stable_parts.append(claude_md)
 
-    mode = state.get("permission_mode", "default")
-    sections.append(_get_permission_section(mode))
+    stable_parts.append(_get_permission_section(mode))
     if mode == "plan":
-        sections.append(_PLAN_MODE_EXTRA)
+        stable_parts.append(_PLAN_MODE_EXTRA)
 
-    sections.append(_TOOL_RULES)
+    stable_parts.append(_TOOL_RULES)
 
-    # sideQuery：让小模型从索引中选出相关记忆，注入完整内容
+    # ── 动态后缀（含时间戳，每轮不同）───────────────────────────────────────
+    dynamic_parts: list[str] = [_get_env_section()]
+
+    git_ctx = _get_git_context()
+    if git_ctx:
+        dynamic_parts.append(git_ctx)
+
+    # sideQuery：从索引中选出相关记忆注入
     already_surfaced: set[str] = state.get("surfaced_memories", set()) or set()
     session_bytes: int = state.get("session_memory_bytes", 0) or 0
 
@@ -224,49 +246,68 @@ async def build_system_prompt(
             model=model,
             already_surfaced=already_surfaced,
             session_bytes_used=session_bytes,
+            recent_tools=recent_tools,
         )
         if mem_section:
-            sections.append(mem_section)
+            dynamic_parts.append(mem_section)
     else:
         newly_surfaced = set()
         bytes_added = 0
 
     skill_catalog = build_skill_catalog()
     if skill_catalog:
-        sections.append(skill_catalog)
+        dynamic_parts.append(skill_catalog)
 
-    return "\n\n".join(sections), newly_surfaced, bytes_added
+    stable_text  = _join(*stable_parts)
+    dynamic_text = _join(*dynamic_parts)
+
+    if _is_anthropic_model(model):
+        # Anthropic prompt caching：稳定前缀打 ephemeral 标记
+        content: list[dict] = [
+            {
+                "type": "text",
+                "text": stable_text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        if dynamic_text:
+            content.append({"type": "text", "text": dynamic_text})
+        return content, newly_surfaced, bytes_added
+
+    # OpenAI / Qwen：纯字符串，稳定内容置前以利自动前缀缓存
+    return _join(stable_text, dynamic_text), newly_surfaced, bytes_added
 
 
 def build_system_prompt_sync(state: AgentState) -> str:
     """
     不含记忆注入的同步版本，用于子 Agent 或无法 await 的场景。
+    保持与 async 版本相同的 section 顺序（稳定前缀在前）。
     """
-    sections: list[str] = []
+    mode = state.get("permission_mode", "default")
 
-    sections.append(_IDENTITY)
-    sections.append(_get_env_section())
-
-    git_ctx = _get_git_context()
-    if git_ctx:
-        sections.append(git_ctx)
+    stable_parts: list[str] = [_IDENTITY]
 
     claude_md = _load_claude_md()
     if claude_md:
-        sections.append(claude_md)
+        stable_parts.append(claude_md)
 
-    mode = state.get("permission_mode", "default")
-    sections.append(_get_permission_section(mode))
+    stable_parts.append(_get_permission_section(mode))
     if mode == "plan":
-        sections.append(_PLAN_MODE_EXTRA)
+        stable_parts.append(_PLAN_MODE_EXTRA)
 
-    sections.append(_TOOL_RULES)
+    stable_parts.append(_TOOL_RULES)
+
+    dynamic_parts: list[str] = [_get_env_section()]
+
+    git_ctx = _get_git_context()
+    if git_ctx:
+        dynamic_parts.append(git_ctx)
 
     skill_catalog = build_skill_catalog()
     if skill_catalog:
-        sections.append(skill_catalog)
+        dynamic_parts.append(skill_catalog)
 
-    return "\n\n".join(sections)
+    return _join(*stable_parts, *dynamic_parts)
 
 
 # ── 会话标题生成 ──────────────────────────────────────────────────────────────

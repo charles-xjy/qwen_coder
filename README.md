@@ -164,10 +164,18 @@ LLM 摘要失败时自动降级为 Snipping。
 - 存储路径：`~/.qwen-coder/projects/{project_hash}/memory/`
 - 每条记忆是一个 Markdown 文件，YAML frontmatter 含 `name` / `description` / `type`
 - `MEMORY.md` 为自动维护的索引（最多 200 行，25KB 上限）
-- **检索方式：sideQuery** — 把索引发给 LLM，由 LLM 从中选出最相关的 5 个文件名，异步后台执行
+- **检索方式：sideQuery** — 把记忆 manifest 发给 LLM，由 LLM 从中选出最相关的 5 个文件名，异步后台执行
 - 4 种记忆类型：`user`（用户偏好）/ `feedback`（行为反馈）/ `project`（项目背景）/ `reference`（外部资源指针）
 - 大小限制：单文件 4KB，单会话注入上限 60KB
 - 记忆超过 1 天时展示新鲜度警告
+
+**sideQuery 优化（参考 cc-haha 实现）：**
+
+| 优化点 | 说明 |
+|---|---|
+| `recentTools` 过滤 | 本轮已调用过的工具，其 `reference` 类型文档不再注入——对话历史中已有使用示例 |
+| `max_tokens=256` 约束 | sideQuery 调用限制输出长度，5 个文件名的 JSON 远不到 256 token，避免模型输出冗余文字 |
+| 精确 JSON 正则 | 用 `r"\{[^{}]*\}"` 替代 `r"\{.*\}"`，不跨嵌套括号误匹配 |
 
 ### 六、Skills 系统
 
@@ -220,6 +228,36 @@ uvx opensandbox-server
 - `edit_file` 结果渲染为 diff（红色删除行，绿色新增行）
 - 处理中 spinner 动画
 - REPL 内置命令：`/clear` `/cost` `/compact` `/memory` `/skills`
+
+### 十、Prompt Caching（减少重复 token 消耗）
+
+system prompt 每轮都会重建，但其中大部分内容在会话期间保持不变。本项目将 system prompt 拆分为**稳定前缀**和**动态后缀**，利用 provider 的 prompt caching 机制减少 input token 费用。
+
+**Section 顺序设计：**
+
+```
+稳定前缀（跨轮次内容不变）          动态后缀（含时间戳，每轮不同）
+─────────────────────────         ─────────────────────────────
+  _IDENTITY                           env section（含当前时间）
+  CLAUDE.md                           git context
+  permission section                  memories（sideQuery 每轮结果）
+  _TOOL_RULES                         skills catalog
+```
+
+**Anthropic 后端（显式缓存）：**
+
+用 `cache_control: {"type": "ephemeral"}` 标记稳定前缀，Anthropic API 将该前缀的 KV 缓存 5 分钟。命中缓存时，cached input token 费率为原价的 1/10。
+
+```python
+SystemMessage(content=[
+    {"type": "text", "text": stable_prefix, "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": dynamic_suffix},
+])
+```
+
+**OpenAI / Qwen 后端（自动缓存）：**
+
+OpenAI 对超过 1024 token 的输入自动缓存前缀，无需额外参数。通过把不含时间戳的稳定内容放在最前面，最大化自动缓存命中率。返回普通字符串，格式不变。
 
 ---
 

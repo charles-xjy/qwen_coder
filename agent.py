@@ -71,6 +71,22 @@ def _last_human_text(messages: list) -> str:
     return ""
 
 
+def _recent_tool_names(messages: list, last_n_turns: int = 3) -> list[str]:
+    """提取最近 N 轮 AIMessage 中调用过的工具名（去重），用于 sideQuery recentTools 过滤。"""
+    seen: set[str] = set()
+    turns = 0
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            turns += 1
+            if turns > last_n_turns:
+                break
+            for tc in getattr(msg, "tool_calls", []) or []:
+                name = tc.get("name", "")
+                if name:
+                    seen.add(name)
+    return list(seen)
+
+
 # ── 主图构建函数 ──────────────────────────────────────────────────────────────
 
 def build_graph(model: Any, max_turns: int = 100):
@@ -98,8 +114,9 @@ def build_graph(model: Any, max_turns: int = 100):
 
         # 构建 system prompt（sideQuery 选出相关记忆注入）
         user_text = _last_human_text(state["messages"])
+        recent_tools = _recent_tool_names(state["messages"])
         prompt, newly_surfaced, bytes_added = await build_system_prompt(
-            state, model, user_text
+            state, model, user_text, recent_tools
         )
 
         # system message 不进 state，只在调用时临时拼接
