@@ -244,6 +244,8 @@ system prompt 每轮都会重建，但其中大部分内容在会话期间保持
   _TOOL_RULES                         skills catalog
 ```
 
+语义上最自然的顺序应该是 `_IDENTITY → CLAUDE.md → memories → permission → tool_rules → env`——先身份、再项目背景、再长期记忆、最后才是规则和环境。但 **memories 必须放在动态后缀**，因为 sideQuery 每轮根据用户输入动态选取不同的记忆文件注入，内容每轮都变，放入稳定前缀会导致缓存每轮失效。注意 `MEMORY.md`（索引文件）本身不会注入 prompt，只是 sideQuery 内部用来筛选文件名的；真正注入的是被选中的那几条记忆的完整 Markdown 内容，那部分才是动态的。当前顺序是为缓存命中率向语义顺序妥协的结果。
+
 **Anthropic 后端（显式缓存）：**
 
 用 `cache_control: {"type": "ephemeral"}` 标记稳定前缀，Anthropic API 将该前缀的 KV 缓存 5 分钟。命中缓存时，cached input token 费率为原价的 1/10。
