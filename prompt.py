@@ -17,7 +17,6 @@ import os
 import platform
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -97,7 +96,6 @@ def _get_env_section() -> str:
         shell = os.environ.get("SHELL", "/bin/bash")
 
     cwd = os.getcwd()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
     python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
     return (
@@ -105,7 +103,6 @@ def _get_env_section() -> str:
         f"- 操作系统：{os_name}\n"
         f"- Shell：{shell}\n"
         f"- 工作目录：{cwd}\n"
-        f"- 当前时间：{now}\n"
         f"- Python：{python_ver}"
     )
 
@@ -185,9 +182,16 @@ _PLAN_MODE_EXTRA = """\
 
 # ── Prompt Cache 辅助 ─────────────────────────────────────────────────────────
 
-def _is_anthropic_model(model: Any) -> bool:
-    """检测是否为 ChatAnthropic，用于决定是否注入 cache_control。"""
-    return type(model).__module__.startswith("langchain_anthropic")
+def _supports_explicit_cache(model: Any) -> bool:
+    """
+    检测 provider 是否支持 cache_control: ephemeral 显式缓存标记。
+    - Anthropic：原生支持
+    - Qwen/DashScope：通过 OpenAI 兼容接口支持，命中费率 10%（低于隐式缓存的 20%）
+    """
+    if type(model).__module__.startswith("langchain_anthropic"):
+        return True
+    base_url = str(getattr(model, "openai_api_base", "") or "")
+    return "dashscope.aliyuncs.com" in base_url
 
 
 def _join(*parts: str) -> str:
@@ -219,6 +223,8 @@ async def build_system_prompt(
     # ── 稳定前缀（可缓存）────────────────────────────────────────────────────
     stable_parts: list[str] = [_IDENTITY]
 
+    stable_parts.append(_get_env_section())
+
     claude_md = _load_claude_md()
     if claude_md:
         stable_parts.append(claude_md)
@@ -229,8 +235,8 @@ async def build_system_prompt(
 
     stable_parts.append(_TOOL_RULES)
 
-    # ── 动态后缀（含时间戳，每轮不同）───────────────────────────────────────
-    dynamic_parts: list[str] = [_get_env_section()]
+    # ── 动态后缀（每轮可能变化）──────────────────────────────────────────────
+    dynamic_parts: list[str] = []
 
     git_ctx = _get_git_context()
     if git_ctx:
@@ -261,7 +267,7 @@ async def build_system_prompt(
     stable_text  = _join(*stable_parts)
     dynamic_text = _join(*dynamic_parts)
 
-    if _is_anthropic_model(model):
+    if _supports_explicit_cache(model):
         # Anthropic prompt caching：稳定前缀打 ephemeral 标记
         content: list[dict] = [
             {
@@ -287,6 +293,8 @@ def build_system_prompt_sync(state: AgentState) -> str:
 
     stable_parts: list[str] = [_IDENTITY]
 
+    stable_parts.append(_get_env_section())
+
     claude_md = _load_claude_md()
     if claude_md:
         stable_parts.append(claude_md)
@@ -297,7 +305,7 @@ def build_system_prompt_sync(state: AgentState) -> str:
 
     stable_parts.append(_TOOL_RULES)
 
-    dynamic_parts: list[str] = [_get_env_section()]
+    dynamic_parts: list[str] = []
 
     git_ctx = _get_git_context()
     if git_ctx:

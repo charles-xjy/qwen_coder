@@ -236,13 +236,16 @@ system prompt 每轮都会重建，但其中大部分内容在会话期间保持
 **Section 顺序设计：**
 
 ```
-稳定前缀（跨轮次内容不变）          动态后缀（含时间戳，每轮不同）
+稳定前缀（会话期间不变）            动态后缀（每轮可能变化）
 ─────────────────────────         ─────────────────────────────
-  _IDENTITY                           env section（含当前时间）
-  CLAUDE.md                           git context
-  permission section                  memories（sideQuery 每轮结果）
-  _TOOL_RULES                         skills catalog
+  _IDENTITY                           git context
+  env section（无时间戳）              memories（sideQuery 每轮结果）
+  CLAUDE.md                           skills catalog
+  permission section
+  _TOOL_RULES
 ```
+
+env section 包含操作系统、Shell、工作目录、Python 版本，去掉了时间戳（精确到分钟的时间对编程任务没有实际用处，却会每分钟破坏一次缓存）。去掉后整个 env section 在会话期间完全不变，可以进稳定前缀。
 
 语义上最自然的顺序应该是 `_IDENTITY → CLAUDE.md → memories → permission → tool_rules → env`——先身份、再项目背景、再长期记忆、最后才是规则和环境。但 **memories 必须放在动态后缀**，因为 sideQuery 每轮根据用户输入动态选取不同的记忆文件注入，内容每轮都变，放入稳定前缀会导致缓存每轮失效。注意 `MEMORY.md`（索引文件）本身不会注入 prompt，只是 sideQuery 内部用来筛选文件名的；真正注入的是被选中的那几条记忆的完整 Markdown 内容，那部分才是动态的。当前顺序是为缓存命中率向语义顺序妥协的结果。
 
@@ -260,6 +263,28 @@ SystemMessage(content=[
 **OpenAI / Qwen 后端（自动缓存）：**
 
 OpenAI 对超过 1024 token 的输入自动缓存前缀，无需额外参数。通过把不含时间戳的稳定内容放在最前面，最大化自动缓存命中率。返回普通字符串，格式不变。
+
+**压缩与缓存的矛盾：**
+
+上下文压缩（snipping / micro-compact / LLM 摘要）和前缀缓存命中是互斥的——缓存本质是按前缀哈希索引的 KV，是只读的，改写历史消息意味着前缀字节变化，已缓存内容全部失效，没有任何 provider 提供"原地修改缓存"的 API。
+
+```
+第 1 轮：[system][tools][消息1][read_file: 12KB 全文][AI回复1]  ← 前缀被缓存
+第 2 轮压缩后：[system][tools][消息1][摘要200字][AI回复1][消息2]
+                                          ↑ 字节变了，从这里起全部 miss，付一次缓存重建费
+```
+
+三种主流方案都绕不开这个物理事实，区别只在于谁来管这笔账：
+
+| 方案 | 代表 | 做法 |
+|---|---|---|
+| **客户端自律** | Reasonix / DeepSeek | 只追加、轮末压尾部、历史绝不改写，靠代码纪律保缓存 |
+| **客户端编辑** | cc-haha / 本项目 | 客户端自己改消息数组，批量化压缩控制失效代价 |
+| **服务端编辑** | Anthropic context editing | 把清理逻辑搬进 API，`clear_at_least` 参数保证每次清除量"值回票价" |
+
+Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版的 micro-compact：API 自动按时间顺序清除最旧的工具结果，替换成占位符——和本项目 `compressor.py` 的 snipping 逻辑等价，只是搬到了服务端。官方文档也明确说：清除 = 缓存失效，所以提供了 `clear_at_least` 参数，让你攒够一批再清，别零敲碎打地反复付重建费。
+
+本项目使用 OpenAI 兼容接口（Qwen），没有服务端编辑 API，压缩触发时接受一次缓存失效。取舍是：**平时靠稳定前缀省钱，context 快满时接受一次失效换空间**，整体仍然划算。
 
 ---
 

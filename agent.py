@@ -87,6 +87,69 @@ def _recent_tool_names(messages: list, last_n_turns: int = 3) -> list[str]:
     return list(seen)
 
 
+def _apply_history_cache_markers(messages: list) -> list:
+    """
+    给对话历史打显式缓存标记（cache_control: ephemeral）。
+
+    约束：
+    - 单次请求最多 4 个 cache_control 标记，system prompt 已占 1 个，
+      历史消息最多还能打 3 个（MAX_HISTORY_MARKERS）
+    - Qwen 每个标记向前最多回溯 20 个 content block，所以每 20 条打一个
+
+    策略：从历史末尾（最后一条 AIMessage）向前，每隔 20 条选一个位置，
+    最多选 3 个，优先覆盖最近的历史（最近的缓存命中收益最高）。
+
+    跳过最后一条 HumanMessage（当前轮用户输入），本轮响应完成后才能命中。
+    """
+    MAX_HISTORY_MARKERS = 3  # 4 个总限额 - 1 个 system prompt 已占用
+    BLOCK_INTERVAL      = 20  # 每个标记向前覆盖 20 个 content block
+
+    # 分离当前轮 HumanMessage（不打标记）
+    last_human_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            last_human_idx = i
+            break
+
+    history = messages[:last_human_idx] if last_human_idx >= 0 else list(messages)
+    tail    = messages[last_human_idx:] if last_human_idx >= 0 else []
+
+    if not history:
+        return list(messages)
+
+    # 找历史中最后一条 AIMessage 的位置作为起点
+    last_ai_idx = -1
+    for i in range(len(history) - 1, -1, -1):
+        if isinstance(history[i], AIMessage):
+            last_ai_idx = i
+            break
+
+    if last_ai_idx < 0:
+        return list(messages)
+
+    # 从 last_ai_idx 向前每隔 BLOCK_INTERVAL 选标记位置，最多 MAX_HISTORY_MARKERS 个
+    mark_positions: set[int] = set()
+    pos = last_ai_idx
+    while pos >= 0 and len(mark_positions) < MAX_HISTORY_MARKERS:
+        mark_positions.add(pos)
+        pos -= BLOCK_INTERVAL
+
+    def _mark(msg):
+        content = msg.content
+        if isinstance(content, str):
+            return msg.model_copy(update={"content": [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]})
+        if isinstance(content, list) and content:
+            return msg.model_copy(update={"content":
+                content[:-1] + [{**content[-1], "cache_control": {"type": "ephemeral"}}]
+            })
+        return msg
+
+    result = [_mark(msg) if i in mark_positions else msg for i, msg in enumerate(history)]
+    return result + tail
+
+
 # ── 主图构建函数 ──────────────────────────────────────────────────────────────
 
 def build_graph(model: Any, max_turns: int = 100):
@@ -120,7 +183,14 @@ def build_graph(model: Any, max_turns: int = 100):
         )
 
         # system message 不进 state，只在调用时临时拼接
-        messages_for_llm = [SystemMessage(content=prompt)] + list(state["messages"])
+        # 支持显式缓存的 provider：给对话历史打缓存标记（最多 3 个，覆盖最近 60 条）
+        from prompt import _supports_explicit_cache
+        history = (
+            _apply_history_cache_markers(list(state["messages"]))
+            if _supports_explicit_cache(model)
+            else list(state["messages"])
+        )
+        messages_for_llm = [SystemMessage(content=prompt)] + history
 
         # 调用 LLM
         response = await bound_model.ainvoke(messages_for_llm)
