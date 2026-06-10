@@ -172,7 +172,7 @@ async def restore_session(app: Any, config: dict, session_id: str) -> None:
     state["total_output_tokens"]  = meta.get("total_output_tokens", 0)
     state["session_memory_bytes"] = meta.get("session_memory_bytes", 0)
 
-    await app.aupdate_state(config, state)
+    await app.aupdate_state(config, state, as_node="agent")
 
 
 # ── 每轮存档 ──────────────────────────────────────────────────────────────────

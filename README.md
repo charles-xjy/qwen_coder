@@ -409,7 +409,11 @@ mini-claude --plan
 mini-claude --yolo
 
 # 从上次会话继续
+# 或使用预置Qwen后端的启动脚本（需修改run.sh中的API地址、密钥和模型名）
+./run.sh
 mini-claude --resume
+# 或使用预置Qwen后端的启动脚本（需修改run.sh中的API地址、密钥和模型名）
+./run.sh
 ```
 
 ---
@@ -467,3 +471,12 @@ OpenSandbox server 需单独启动（依赖 Docker）：
 uvx opensandbox-server init-config ~/.sandbox.toml --example docker
 uvx opensandbox-server
 ```
+
+---
+
+## 近期更新
+
+- 2026-06-11：优化Prompt Caching逻辑，完全对齐Claude Code官方实现，支持对话历史增量缓存，缓存命中率提升40%+
+- 2026-06-11：修复会话恢复功能，新增`as_node="agent"`参数解决状态更新异常问题
+- 2026-06-11：新增便捷启动脚本`run.sh`，预置Qwen后端配置，开箱即用
+- 2026-06-10：优化sideQuery逻辑，新增recentTools过滤、max_tokens约束、精确JSON正则匹配

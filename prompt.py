@@ -215,28 +215,29 @@ async def build_system_prompt(
       - 其他模型：str，稳定内容置前（利于 OpenAI/Qwen 自动前缀缓存）
 
     Section 顺序设计：
-      稳定前缀（跨轮次内容不变）：identity → CLAUDE.md → permission → tool_rules
-      动态后缀（含时间戳/每轮变化）：env → git → memories → skills
+      稳定前缀（绝对不变）：identity → tool_rules
+      动态后缀（随环境/模式/轮次变化）：env → CLAUDE.md → permission → git → memories → skills
     """
     mode = state.get("permission_mode", "default")
 
-    # ── 稳定前缀（可缓存）────────────────────────────────────────────────────
-    stable_parts: list[str] = [_IDENTITY]
-
-    stable_parts.append(_get_env_section())
-
-    claude_md = _load_claude_md()
-    if claude_md:
-        stable_parts.append(claude_md)
-
-    stable_parts.append(_get_permission_section(mode))
-    if mode == "plan":
-        stable_parts.append(_PLAN_MODE_EXTRA)
-
-    stable_parts.append(_TOOL_RULES)
+    # ── 稳定前缀（可缓存 —— 只有永远不会变的内容）─────────────────────────
+    stable_parts: list[str] = [_IDENTITY, _TOOL_RULES]
 
     # ── 动态后缀（每轮可能变化）──────────────────────────────────────────────
     dynamic_parts: list[str] = []
+
+    # 环境信息（cwd 可能变化）
+    dynamic_parts.append(_get_env_section())
+
+    # CLAUDE.md（agent 可能编辑它）
+    claude_md = _load_claude_md()
+    if claude_md:
+        dynamic_parts.append(claude_md)
+
+    # 权限模式（进入/退出 plan 模式会变化）
+    dynamic_parts.append(_get_permission_section(mode))
+    if mode == "plan":
+        dynamic_parts.append(_PLAN_MODE_EXTRA)
 
     git_ctx = _get_git_context()
     if git_ctx:
@@ -291,21 +292,24 @@ def build_system_prompt_sync(state: AgentState) -> str:
     """
     mode = state.get("permission_mode", "default")
 
-    stable_parts: list[str] = [_IDENTITY]
+    # 稳定前缀（只有永远不会变的内容）
+    stable_parts: list[str] = [_IDENTITY, _TOOL_RULES]
 
-    stable_parts.append(_get_env_section())
+    # 动态后缀（随环境/模式/轮次变化）
+    dynamic_parts: list[str] = []
 
+    # 环境信息（cwd 可能变化）
+    dynamic_parts.append(_get_env_section())
+
+    # CLAUDE.md（agent 可能编辑它）
     claude_md = _load_claude_md()
     if claude_md:
-        stable_parts.append(claude_md)
+        dynamic_parts.append(claude_md)
 
-    stable_parts.append(_get_permission_section(mode))
+    # 权限模式（进入/退出 plan 模式会变化）
+    dynamic_parts.append(_get_permission_section(mode))
     if mode == "plan":
-        stable_parts.append(_PLAN_MODE_EXTRA)
-
-    stable_parts.append(_TOOL_RULES)
-
-    dynamic_parts: list[str] = []
+        dynamic_parts.append(_PLAN_MODE_EXTRA)
 
     git_ctx = _get_git_context()
     if git_ctx:

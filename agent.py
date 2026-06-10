@@ -31,6 +31,7 @@ from state import AgentState
 from subagent import handle_agent_tool
 from tools import check_permission, execute_tool, get_active_tool_definitions
 
+
 # ── 工具 Schema → LangChain 格式 ─────────────────────────────────────────────
 
 def _to_lc_tools(schemas: list[dict]) -> list[dict]:
@@ -39,9 +40,9 @@ def _to_lc_tools(schemas: list[dict]) -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name":        s["name"],
+                "name": s["name"],
                 "description": s["description"],
-                "parameters":  s.get("input_schema", {"type": "object", "properties": {}}),
+                "parameters": s.get("input_schema", {"type": "object", "properties": {}}),
             },
         }
         for s in schemas
@@ -89,52 +90,25 @@ def _recent_tool_names(messages: list, last_n_turns: int = 3) -> list[str]:
 
 def _apply_history_cache_markers(messages: list) -> list:
     """
-    给对话历史打显式缓存标记（cache_control: ephemeral）。
+    给对话历史打显式缓存标记（cache_control: ephemeral），完全对齐Claude Code官方实现。
 
-    约束：
-    - 单次请求最多 4 个 cache_control 标记，system prompt 已占 1 个，
-      历史消息最多还能打 3 个（MAX_HISTORY_MARKERS）
-    - Qwen 每个标记向前最多回溯 20 个 content block，所以每 20 条打一个
+    缓存机制：
+    - 全局总共2个缓存标记：1个在system prompt稳定段结尾（prompt.py中实现），1个在messages最后一条
+    - 每个标记对应一个固定缓存槽位，覆盖从prompt开头到标记位置的全部内容，新快照自动覆盖旧槽位
+    - 20是官方回溯查找窗口大小：新请求从标记位置往回找20个block，找到上一轮匹配的标记就命中缓存
+    - Mycro逐轮淘汰：单标记让无用KV page立即释放，多标记反而浪费（官方注释：claude.ts L3146）
 
-    策略：从历史末尾（最后一条 AIMessage）向前，每隔 20 条选一个位置，
-    最多选 3 个，优先覆盖最近的历史（最近的缓存命中收益最高）。
-
-    跳过最后一条 HumanMessage（当前轮用户输入），本轮响应完成后才能命中。
+    标记策略：
+    - 直接打在 messages 最后一条消息上（对齐官方 markerIndex = messages.length - 1）
+    - 最后一条即为本轮用户输入，当前请求缓存它，下一轮作为前缀命中
     """
-    MAX_HISTORY_MARKERS = 3  # 4 个总限额 - 1 个 system prompt 已占用
-    BLOCK_INTERVAL      = 20  # 每个标记向前覆盖 20 个 content block
-
-    # 分离当前轮 HumanMessage（不打标记）
-    last_human_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            last_human_idx = i
-            break
-
-    history = messages[:last_human_idx] if last_human_idx >= 0 else list(messages)
-    tail    = messages[last_human_idx:] if last_human_idx >= 0 else []
-
-    if not history:
+    if not messages:
         return list(messages)
 
-    # 找历史中最后一条 AIMessage 的位置作为起点
-    last_ai_idx = -1
-    for i in range(len(history) - 1, -1, -1):
-        if isinstance(history[i], AIMessage):
-            last_ai_idx = i
-            break
-
-    if last_ai_idx < 0:
-        return list(messages)
-
-    # 从 last_ai_idx 向前每隔 BLOCK_INTERVAL 选标记位置，最多 MAX_HISTORY_MARKERS 个
-    mark_positions: set[int] = set()
-    pos = last_ai_idx
-    while pos >= 0 and len(mark_positions) < MAX_HISTORY_MARKERS:
-        mark_positions.add(pos)
-        pos -= BLOCK_INTERVAL
+    last_idx = len(messages) - 1
 
     def _mark(msg):
+        """给消息打缓存标记，仅修改最后一个content block，避免破坏原有结构"""
         content = msg.content
         if isinstance(content, str):
             return msg.model_copy(update={"content": [
@@ -142,15 +116,12 @@ def _apply_history_cache_markers(messages: list) -> list:
             ]})
         if isinstance(content, list) and content:
             return msg.model_copy(update={"content":
-                content[:-1] + [{**content[-1], "cache_control": {"type": "ephemeral"}}]
-            })
+                                              content[:-1] + [{**content[-1], "cache_control": {"type": "ephemeral"}}]
+                                          })
         return msg
 
-    result = [_mark(msg) if i in mark_positions else msg for i, msg in enumerate(history)]
-    return result + tail
+    return [_mark(msg) if i == last_idx else msg for i, msg in enumerate(messages)]
 
-
-# ── 主图构建函数 ──────────────────────────────────────────────────────────────
 
 def build_graph(model: Any, max_turns: int = 100):
     """
@@ -183,7 +154,7 @@ def build_graph(model: Any, max_turns: int = 100):
         )
 
         # system message 不进 state，只在调用时临时拼接
-        # 支持显式缓存的 provider：给对话历史打缓存标记（最多 3 个，覆盖最近 60 条）
+        # 支持显式缓存的 provider：给对话历史打缓存标记（仅1个，对齐Claude Code实现）
         from prompt import _supports_explicit_cache
         history = (
             _apply_history_cache_markers(list(state["messages"]))
@@ -197,26 +168,26 @@ def build_graph(model: Any, max_turns: int = 100):
 
         # 提取 token 用量（LangChain usage_metadata 兼容多种后端）
         usage = getattr(response, "usage_metadata", None) or {}
-        input_tokens  = usage.get("input_tokens",  0)
+        input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
 
         return {
-            "messages":               [response],
-            "current_turns":          turns + 1,
-            "last_api_call_time":     time.time(),
+            "messages": [response],
+            "current_turns": turns + 1,
+            "last_api_call_time": time.time(),
             "last_input_token_count": input_tokens,
-            "total_input_tokens":     (state.get("total_input_tokens")  or 0) + input_tokens,
-            "total_output_tokens":    (state.get("total_output_tokens") or 0) + output_tokens,
-            "surfaced_memories":      (state.get("surfaced_memories")   or set()) | newly_surfaced,
-            "session_memory_bytes":   (state.get("session_memory_bytes") or 0) + bytes_added,
+            "total_input_tokens": (state.get("total_input_tokens") or 0) + input_tokens,
+            "total_output_tokens": (state.get("total_output_tokens") or 0) + output_tokens,
+            "surfaced_memories": (state.get("surfaced_memories") or set()) | newly_surfaced,
+            "session_memory_bytes": (state.get("session_memory_bytes") or 0) + bytes_added,
         }
 
     # ── tools 节点 ───────────────────────────────────────────────────────────
 
     async def tools_node(state: AgentState) -> dict:
-        messages         = state["messages"]
-        permission_mode  = state.get("permission_mode", "default")
-        confirmed_paths  = state.get("confirmed_paths", set()) or set()
+        messages = state["messages"]
+        permission_mode = state.get("permission_mode", "default")
+        confirmed_paths = state.get("confirmed_paths", set()) or set()
 
         # 取最后一条 AIMessage 的 tool_calls
         last_ai = next(
@@ -283,12 +254,12 @@ def build_graph(model: Any, max_turns: int = 100):
             updates["confirmed_paths"] = confirmed_paths | new_confirmed
 
         if plan_mode_change == "__enter_plan_mode__":
-            updates["pre_plan_mode"]   = permission_mode
+            updates["pre_plan_mode"] = permission_mode
             updates["permission_mode"] = "plan"
         elif plan_mode_change == "__exit_plan_mode__":
             prev = state.get("pre_plan_mode", "default")
             updates["permission_mode"] = prev
-            updates["pre_plan_mode"]   = ""
+            updates["pre_plan_mode"] = ""
 
         return updates
 
@@ -328,15 +299,15 @@ def build_graph(model: Any, max_turns: int = 100):
 
     # ── 组装 StateGraph ───────────────────────────────────────────────────────
 
-    token_router  = make_token_router()
-    warn_node     = create_warn_node()
+    token_router = make_token_router()
+    warn_node = create_warn_node()
     compress_node = create_compress_node(model)
 
     builder = StateGraph(AgentState)
 
-    builder.add_node("agent",    agent_node)
-    builder.add_node("tools",    tools_node)
-    builder.add_node("warn",     warn_node)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("warn", warn_node)
     builder.add_node("compress", compress_node)
 
     builder.set_entry_point("agent")
@@ -366,16 +337,16 @@ def build_graph(model: Any, max_turns: int = 100):
 def make_initial_state(permission_mode: str = "default") -> dict:
     """生成初始 AgentState，供第一次 ainvoke/astream 使用。"""
     return {
-        "messages":               [],
-        "permission_mode":        permission_mode,
-        "pre_plan_mode":          "",
-        "confirmed_paths":        set(),
-        "total_input_tokens":     0,
-        "total_output_tokens":    0,
+        "messages": [],
+        "permission_mode": permission_mode,
+        "pre_plan_mode": "",
+        "confirmed_paths": set(),
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
         "last_input_token_count": 0,
-        "last_api_call_time":     0.0,
-        "current_turns":          0,
-        "compress_choice":        "",
-        "surfaced_memories":      set(),
-        "session_memory_bytes":   0,
+        "last_api_call_time": 0.0,
+        "current_turns": 0,
+        "compress_choice": "",
+        "surfaced_memories": set(),
+        "session_memory_bytes": 0,
     }
