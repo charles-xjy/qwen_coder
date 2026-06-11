@@ -279,6 +279,9 @@ async def _main() -> None:
             await run_repl(app, config, model, session_id)
     finally:
         await _save_title(session_id, model, app, config)
+        from memory import increment_dream_session, trigger_dream
+        increment_dream_session()
+        await trigger_dream(model)
 
 
 def main() -> None:

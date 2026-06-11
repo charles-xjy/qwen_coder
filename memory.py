@@ -376,3 +376,206 @@ async def get_memories_for_prompt(
         return "", set(), 0
 
     return "".join(sections), newly_surfaced, bytes_added
+
+
+# ── AutoDream：定期记忆整合 ───────────────────────────────────────────────────
+
+_DREAM_MIN_HOURS    = 24   # 距上次整合至少 24 小时
+_DREAM_MIN_SESSIONS = 5    # 至少累计 5 个会话
+_dream_lock         = False
+
+
+def _dream_state_path() -> Path:
+    return _memory_dir() / ".dream_state.json"
+
+
+def _load_dream_state() -> dict:
+    path = _dream_state_path()
+    if not path.exists():
+        return {"last_dream_time": 0.0, "sessions_since_dream": 0}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_dream_time": 0.0, "sessions_since_dream": 0}
+
+
+def _save_dream_state(state: dict) -> None:
+    _dream_state_path().write_text(json.dumps(state), encoding="utf-8")
+
+
+def increment_dream_session() -> None:
+    """每次会话结束时调用，累计会话计数。"""
+    state = _load_dream_state()
+    state["sessions_since_dream"] = state.get("sessions_since_dream", 0) + 1
+    _save_dream_state(state)
+
+
+def _should_run_dream() -> bool:
+    state = _load_dream_state()
+    hours_since = (time.time() - state.get("last_dream_time", 0)) / 3600
+    sessions    = state.get("sessions_since_dream", 0)
+    return hours_since >= _DREAM_MIN_HOURS and sessions >= _DREAM_MIN_SESSIONS
+
+
+_DREAM_PROMPT = """\
+你是记忆管理专家。以下是所有现有记忆文件的完整内容。
+
+请整合这些记忆：
+1. 合并重复或高度相关的条目为单条更完整的记忆
+2. 删除过时、矛盾或不再相关的条目
+3. 更新包含陈旧信息的条目
+
+现有记忆：
+{memories}
+
+返回 JSON，描述需执行的操作：
+{{
+  "delete": ["filename1.md"],
+  "update": [{{"filename": "旧文件名.md", "name": "...", "description": "...", "type": "user|feedback|project|reference", "content": "..."}}],
+  "create": [{{"name": "...", "description": "...", "type": "user|feedback|project|reference", "content": "..."}}]
+}}
+只返回 JSON，不加任何解释。\
+"""
+
+
+async def _run_dream_impl(model: Any) -> int:
+    """执行记忆整合，返回实际操作数（delete + update + create）。"""
+    headers = list_memories()
+    if not headers:
+        return 0
+
+    parts = []
+    for h in headers:
+        try:
+            parts.append(f"=== {h.filename} ===\n{h.path.read_text(encoding='utf-8')}")
+        except Exception:
+            continue
+    if not parts:
+        return 0
+
+    prompt = _DREAM_PROMPT.format(memories="\n\n".join(parts)[:12000])
+
+    try:
+        from langchain_core.messages import HumanMessage
+        response = await model.bind(max_tokens=2048).ainvoke([HumanMessage(content=prompt)])
+        match = re.search(r"\{.*\}", response.content.strip(), re.DOTALL)
+        if not match:
+            return 0
+        ops = json.loads(match.group())
+    except Exception:
+        return 0
+
+    count = 0
+
+    for filename in ops.get("delete", []):
+        if delete_memory(filename):
+            count += 1
+
+    for item in ops.get("update", []):
+        old_path = _memory_dir() / item.get("filename", "")
+        try:
+            save_memory(item["name"], item["description"], item["type"], item["content"])
+            new_name = f"{item['type']}_{_slugify(item['name'])}.md"
+            if old_path.exists() and old_path.name != new_name:
+                old_path.unlink(missing_ok=True)
+            count += 1
+        except Exception:
+            pass
+
+    for item in ops.get("create", []):
+        try:
+            save_memory(item["name"], item["description"], item["type"], item["content"])
+            count += 1
+        except Exception:
+            pass
+
+    return count
+
+
+async def trigger_dream(model: Any) -> None:
+    """会话结束时调用：双门槛（时间 + 会话数）均满足才运行整合。
+
+    门槛：距上次整合 ≥ 24h 且累计会话数 ≥ 5。
+    互斥锁防止并发；不满足门槛时立即返回，不阻塞退出。
+    """
+    global _dream_lock
+    if _dream_lock or not _should_run_dream():
+        return
+
+    _dream_lock = True
+    try:
+        print("\033[35m[Dream] 正在整合长期记忆...\033[0m")
+        count = await _run_dream_impl(model)
+        state = _load_dream_state()
+        state["last_dream_time"]     = time.time()
+        state["sessions_since_dream"] = 0
+        _save_dream_state(state)
+        msg = f"完成，执行了 {count} 项操作" if count else "完成，无需整合"
+        print(f"\033[35m[Dream] {msg}\033[0m")
+    except Exception:
+        pass
+    finally:
+        _dream_lock = False
+
+
+# ── 自动记忆写入（fire-and-forget）────────────────────────────────────────────
+
+_AUTO_SAVE_PROMPT = """\
+分析以下对话，判断是否存在值得跨会话保留的长期记忆。
+
+值得保存：
+- user：用户偏好、习惯、工作风格
+- feedback：用户对 Agent 行为的纠正或认可（"不要这样做"、"很好继续这样"）
+- project：项目决策、架构选择、关键约束
+- reference：外部资源位置（URL、文档路径、工具名）
+
+不值得保存：普通问答、代码实现细节、可从代码直接读取的信息。
+
+用户：{user_message}
+
+助手：{assistant_response}
+
+如有值得保存的内容，返回 JSON：
+{{"memories": [{{"name": "简短标题", "description": "一句话摘要", "type": "user|feedback|project|reference", "content": "详细内容（Markdown）"}}]}}
+没有则返回：{{"memories": []}}
+只返回 JSON，不加任何解释。\
+"""
+
+
+async def auto_save_memory(
+    user_message: str,
+    assistant_response: str,
+    model: Any,
+) -> None:
+    """fire-and-forget：分析一轮对话，自动保存值得长期记忆的内容。
+
+    调用方用 asyncio.create_task() 触发，不阻塞主 Agent 循环。
+    内部所有异常静默处理，确保后台任务不会影响主流程。
+    """
+    if not user_message.strip() or not assistant_response.strip():
+        return
+
+    prompt = _AUTO_SAVE_PROMPT.format(
+        user_message=user_message[:800],
+        assistant_response=assistant_response[:800],
+    )
+
+    try:
+        from langchain_core.messages import HumanMessage
+        response = await model.bind(max_tokens=512).ainvoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return
+        data = json.loads(match.group())
+
+        for mem in data.get("memories", []):
+            name        = mem.get("name", "").strip()
+            description = mem.get("description", "").strip()
+            mem_type    = mem.get("type", "").strip()
+            content     = mem.get("content", "").strip()
+            if name and description and mem_type in MEMORY_TYPES and content:
+                save_memory(name, description, mem_type, content)
+    except Exception:
+        pass

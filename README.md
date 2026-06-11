@@ -181,21 +181,40 @@ LLM 摘要失败时自动降级为 Snipping。
 
 ### 五、文件记忆系统
 
-- 存储路径：`~/.qwen-coder/projects/{project_hash}/memory/`
+- 存储路径：`.memory/`（项目级，随代码库版本控制）
 - 每条记忆是一个 Markdown 文件，YAML frontmatter 含 `name` / `description` / `type`
 - `MEMORY.md` 为自动维护的索引（最多 200 行，25KB 上限）
-- **检索方式：sideQuery** — 把记忆 manifest 发给 LLM，由 LLM 从中选出最相关的 5 个文件名，异步后台执行
 - 4 种记忆类型：`user`（用户偏好）/ `feedback`（行为反馈）/ `project`（项目背景）/ `reference`（外部资源指针）
 - 大小限制：单文件 4KB，单会话注入上限 60KB
 - 记忆超过 1 天时展示新鲜度警告
 
-**sideQuery 优化（参考 cc-haha 实现）：**
+**每轮对话涉及两次独立 LLM 调用：**
+
+| 调用 | 时机 | 方式 | 说明 |
+|------|------|------|------|
+| sideQuery（检索） | 主 LLM 调用前 | 串行 await | 将 MEMORY.md 索引发给 LLM，选出最相关的 ≤5 条注入 system prompt |
+| auto_save_memory（写入） | 主 LLM 最终回复后 | `asyncio.create_task` fire-and-forget | 分析本轮对话，判断是否有值得长期保存的内容，有则直接写文件 |
+
+**sideQuery 优化：**
 
 | 优化点 | 说明 |
 |---|---|
 | `recentTools` 过滤 | 本轮已调用过的工具，其 `reference` 类型文档不再注入——对话历史中已有使用示例 |
-| `max_tokens=256` 约束 | sideQuery 调用限制输出长度，5 个文件名的 JSON 远不到 256 token，避免模型输出冗余文字 |
+| `max_tokens=256` 约束 | 5 个文件名的 JSON 远不到 256 token，避免模型输出冗余文字 |
 | 精确 JSON 正则 | 用 `r"\{[^{}]*\}"` 替代 `r"\{.*\}"`，不跨嵌套括号误匹配 |
+
+**AutoDream：定期记忆整合（对齐 cc-haha autoDream）**
+
+积累足够多的会话后，在会话结束时自动触发一次深度整合：合并重复条目、删除过时记忆、更新陈旧内容。
+
+双门槛触发条件（两者同时满足）：
+
+| 门槛 | 默认值 | 说明 |
+|------|--------|------|
+| 时间 | ≥ 24 小时 | 距上次整合的时间 |
+| 会话数 | ≥ 5 次 | 上次整合后累计的会话数 |
+
+状态持久化在 `.memory/.dream_state.json`，互斥锁防止并发，整合完成后重置计数器。不满足门槛时立即返回，不阻塞退出。
 
 ### 六、Skills 系统
 
@@ -565,6 +584,7 @@ uvx opensandbox-server
 
 ## 近期更新
 
+- 2026-06-11：新增 AutoDream 定期记忆整合 — 双门槛（≥24h + ≥5会话）触发，会话结束时自动合并重复、删除过时记忆；新增 auto_save_memory fire-and-forget，每轮最终回复后后台分析是否需要写入长期记忆
 - 2026-06-11：Skills 注入改为主 Agent 显式传入 — `agent` 工具新增 `skills` 参数，子 Agent 启动时自动合并 skill 工具集，`.md` 文件移除静态 `skills` 字段
 - 2026-06-11：子 Agent 系统重构 — 引入 `SubagentConfig` 数据类对齐 cc-haha/Deer Flow，所有 Agent 统一为 `agents/*.md` 文件定义（零硬编码），新增 `disallowed-tools` / `permission-mode` / `timeout-seconds` 字段，三层加载优先级（包内置 → 用户 → 项目）
 - 2026-06-11：优化Prompt Caching逻辑，完全对齐Claude Code官方实现，支持对话历史增量缓存，缓存命中率提升40%+
