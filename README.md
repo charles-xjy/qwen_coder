@@ -30,7 +30,7 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ### 4. 远程沙箱安全执行
 
-集成 OpenSandbox 远程容器，会话级单例管理，文件增量同步（mtime 比对，仅上传变更），已安装包和环境变量在多次调用间保留。危险命令正则拦截（rm -rf / sudo / curl | bash 等 15+ 模式），权限系统支持 5 种模式（default / plan / acceptEdits / bypassPermissions / dontAsk），可通过 `settings.json` 按工具名和路径前缀配置白名单。沙箱不可用时自动询问用户降级到本地执行。
+集成 OpenSandbox 远程容器，会话级单例管理，文件增量同步（mtime 比对，仅上传变更），已安装包和环境变量在多次调用间保留。沙箱本身即为隔离层，命令在容器内执行，不影响宿主机——无需正则拦截命令内容。危险操作防护由权限系统负责：`run_shell` 标记为 `exec` 级，`default` 模式下需用户确认，`plan` 模式下直接拒绝。沙箱不可用时询问用户是否降级到本地执行。
 
 ---
 
