@@ -15,7 +15,7 @@ subagent.py - 子 Agent 系统
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +59,6 @@ class SubagentConfig:
     disallowed_tools: list[str] = field(
         default_factory=lambda: list(_DEFAULT_DISALLOWED_TOOLS)
     )
-    skills: list[str] | None = None              # None = 不注入 skill
     permission_mode: str | None = None           # None = 继承父级
     model: str = "inherit"
     max_turns: int = _DEFAULT_MAX_TURNS
@@ -110,10 +109,6 @@ def _parse_tools_field(raw: str) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def _parse_skills_field(raw: str) -> list[str] | None:
-    """解析 skills 字段，空字符串返回 None。"""
-    return _parse_tools_field(raw)
-
 
 def _parse_permission_mode(raw: str) -> str | None:
     """解析并校验 permission-mode 字段，无效值打印警告并返回 None。"""
@@ -154,17 +149,12 @@ def _load_agents_from_dir(base: Path, result: dict[str, SubagentConfig]) -> None
             else:
                 disallowed_tools = list(_DEFAULT_DISALLOWED_TOOLS)
 
-            # skills：未声明 → None（不注入）；声明但为空 → None（等同不注入）
-            skills_raw = _parse_skills_field(meta.get("skills", ""))
-            skills = skills_raw if skills_raw else None
-
             config = SubagentConfig(
                 name=name,
                 description=meta.get("description", "").strip(),
                 system_prompt=body.strip() or None,
                 allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools,
-                skills=skills,
                 permission_mode=_parse_permission_mode(meta.get("permission-mode", "")),
                 model=meta.get("model", "inherit").strip(),
                 max_turns=int(meta.get("max-turns", str(_DEFAULT_MAX_TURNS))),
@@ -220,16 +210,17 @@ def list_available_subagents() -> list[str]:
 # Skill 注入
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _build_skill_injection(skill_names: list[str]) -> str:
-    """根据 skill 名称列表，生成要注入 system prompt 的 skill 内容段落。
+def _build_skill_injection(skill_names: list[str]) -> tuple[str, list[str]]:
+    """根据 skill 名称列表，生成要注入 system prompt 的 skill 内容段落，
+    同时收集 skill 声明的额外工具名。
 
-    每个 skill 的内容包裹在 <skill name="..."> 标签中，用双换行拼接。
-    对齐 Deer Flow / cc-haha 的 skill 注入格式。
+    返回 (prompt_text, extra_tool_names)。
     """
     from skills import discover_skills, resolve_skill_prompt
 
     all_skills = discover_skills()
     parts: list[str] = []
+    extra_tools: list[str] = []
 
     for name in skill_names:
         skill = all_skills.get(name)
@@ -237,8 +228,10 @@ def _build_skill_injection(skill_names: list[str]) -> str:
             continue
         resolved = resolve_skill_prompt(skill, "")
         parts.append(f'<skill name="{skill.name}">\n{resolved}\n</skill>')
+        if skill.allowed_tools:
+            extra_tools.extend(skill.allowed_tools)
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), extra_tools
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -278,6 +271,7 @@ async def run_sub_agent(
     agent_type: str,
     model: Any,
     parent_permission_mode: str,
+    extra_skills: list[str] | None = None,
 ) -> str:
     """启动一个独立子 Agent，运行完整的工具调用循环，返回最终文本输出。
 
@@ -293,9 +287,27 @@ async def run_sub_agent(
             f"可用类型：{', '.join(list_available_subagents())}"
         )
 
-    # ── 工具过滤 ────────────────────────────────────────────────────────────
+    # ── 收集 skill 内容和额外工具（必须在工具过滤之前）─────────────────────
+    system_parts: list[str] = []
+    skill_extra_tools: list[str] = []
+
+    if config.system_prompt:
+        system_parts.append(config.system_prompt)
+
+    if extra_skills:
+        skill_text, skill_extra_tools = _build_skill_injection(extra_skills)
+        if skill_text:
+            system_parts.append(skill_text)
+
+    # ── 工具过滤（合并 skill 声明的额外工具）────────────────────────────────
     all_schemas = get_active_tool_definitions()
-    allowed_schemas = _filter_tools(all_schemas, config)
+    effective_config = config
+    if skill_extra_tools and config.allowed_tools is not None:
+        # allowed_tools 不为 None 说明是白名单模式，需要合并 skill 工具
+        merged = list(set(config.allowed_tools) | set(skill_extra_tools))
+        effective_config = replace(config, allowed_tools=merged)
+    # allowed_tools 为 None 表示继承全量，skill 工具自然包含在内，无需处理
+    allowed_schemas = _filter_tools(all_schemas, effective_config)
     allowed_names = {t["name"] for t in allowed_schemas}
 
     # ── 权限模式解析 ────────────────────────────────────────────────────────
@@ -311,15 +323,6 @@ async def run_sub_agent(
     sub_model = model.bind_tools(lc_tools) if lc_tools else model
 
     # ── 构建 System Prompt ──────────────────────────────────────────────────
-    system_parts: list[str] = []
-
-    if config.system_prompt:
-        system_parts.append(config.system_prompt)
-
-    if config.skills:
-        skill_text = _build_skill_injection(config.skills)
-        if skill_text:
-            system_parts.append(skill_text)
 
     system_content = "\n\n".join(system_parts)
 
@@ -403,6 +406,7 @@ async def handle_agent_tool(
     description: str,
     model: Any,
     parent_permission_mode: str,
+    skills: list[str] | None = None,
 ) -> str:
     """agent 工具的执行入口。
 
@@ -414,6 +418,7 @@ async def handle_agent_tool(
         agent_type=agent_type,
         model=model,
         parent_permission_mode=parent_permission_mode,
+        extra_skills=skills,
     )
     print(f"\033[36m[子 Agent: {agent_type}] 完成\033[0m")
     return result

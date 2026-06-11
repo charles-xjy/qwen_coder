@@ -532,6 +532,11 @@ _CORE_TOOLS: list[dict] = [
                 "type":        {"type": "string", "description": "子 Agent 类型"},
                 "description": {"type": "string", "description": "任务简述（用于日志展示）"},
                 "prompt":      {"type": "string", "description": "发给子 Agent 的完整指令"},
+                "skills":      {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "要注入的 skill 名称列表，对应 .claude/skills/ 下的 skill 名。skill 的工具会自动合并进子 Agent 的工具集。",
+                },
             },
             "required": ["type", "prompt"],
         },

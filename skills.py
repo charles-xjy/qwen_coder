@@ -208,13 +208,13 @@ def build_skill_catalog() -> str:
         return ""
 
     lines = ["## 可用 Skills\n"]
+    lines.append("用 /skillname 直接触发，或在 agent 工具的 skills 参数中按需传入。\n")
     for skill in sorted(skills.values(), key=lambda s: s.name):
-        invocable = "（用户可触发）" if skill.user_invocable else "（自动触发）"
-        lines.append(f"- `{skill.name}` {invocable}：{skill.description}")
+        lines.append(f"- `{skill.name}`：{skill.description}")
         if skill.when_to_use:
-            lines.append(f"  触发时机：{skill.when_to_use}")
+            lines.append(f"  何时使用：{skill.when_to_use}")
         if skill.allowed_tools:
-            lines.append(f"  工具范围：{', '.join(skill.allowed_tools)}")
+            lines.append(f"  需要工具：{', '.join(skill.allowed_tools)}")
     return "\n".join(lines)
 
 

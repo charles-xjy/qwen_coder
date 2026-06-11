@@ -3,7 +3,6 @@ name: plan
 description: 规划型：设计方案、分析架构，只读不写，输出结构化实现计划
 allowed-tools: read_file, list_files, grep_search
 disallowed-tools:
-skills:
 permission-mode:
 model: inherit
 max-turns: 30

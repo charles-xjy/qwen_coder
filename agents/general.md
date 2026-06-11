@@ -3,7 +3,6 @@ name: general
 description: 通用型：可用于复杂多步任务，拥有除 agent 外的全量工具
 allowed-tools:
 disallowed-tools: agent, enter_plan_mode, exit_plan_mode
-skills:
 permission-mode:
 model: inherit
 max-turns: 50

@@ -3,7 +3,6 @@ name: explore
 description: 只读探索型：搜索文件、阅读代码、定位符号，适合代码库调研
 allowed-tools: read_file, list_files, grep_search
 disallowed-tools:
-skills:
 permission-mode:
 model: inherit
 max-turns: 30

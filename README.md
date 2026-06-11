@@ -18,7 +18,7 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ### 1. 基于 SubagentConfig 的子 Agent 系统
 
-对齐 [cc-haha](https://github.com/NanmiCoder/cc-haha) / [Deer Flow](https://github.com/bytedance/deer-flow) 的配置模型，通过 `SubagentConfig` 数据类统一管理子 Agent 定义——所有 Agent（含内置 explore/plan/general）均为 `agents/*.md` 文件，零硬编码。支持 `allowed-tools` / `disallowed-tools` 双轴工具控制、`skills` 按需注入（`<skill>` 标签嵌入 system prompt）、`permission-mode` 显式指定权限（否则三级继承：config → 父 plan → bypassPermissions）、`timeout-seconds` wall-clock 超时。三层加载优先级：包内置 → `~/.claude/agents/` → `./.claude/agents/`，后层覆盖前层。配套 Skills 渐进式加载机制，通过 SKILL.md frontmatter 声明触发条件和执行模式（inline / fork），Agent 可按需自动调用。
+对齐 [cc-haha](https://github.com/NanmiCoder/cc-haha) / [Deer Flow](https://github.com/bytedance/deer-flow) 的配置模型，通过 `SubagentConfig` 数据类统一管理子 Agent 定义——所有 Agent（含内置 explore/plan/general）均为 `agents/*.md` 文件，零硬编码。支持 `allowed-tools` / `disallowed-tools` 双轴工具控制、`permission-mode` 显式指定权限（否则三级继承：config → 父 plan → bypassPermissions）、`timeout-seconds` wall-clock 超时。三层加载优先级：包内置 → `~/.claude/agents/` → `./.claude/agents/`，后层覆盖前层。Skills 由主 Agent 在调用时按需显式传入（`agent` 工具的 `skills` 参数），skill 的工具集自动合并进子 Agent 白名单，无需在 `.md` 文件中静态声明。
 
 ### 2. 异步记忆检索（SideQuery）
 
@@ -199,9 +199,11 @@ LLM 摘要失败时自动降级为 Snipping。
 
 ### 六、Skills 系统
 
-- 路径：`~/.claude/skills/` 和 `./.claude/skills/`，项目级覆盖用户级
-- 每个 skill 是 `SKILL.md`，frontmatter 含 `name` / `description` / `when_to_use` / `allowed-tools` / `user-invocable` / `context`
-- 触发方式：用户输入 `/skillname args`，或 Agent 调用 `skill` 工具
+- 路径：`~/.claude/skills/*/SKILL.md` 和 `./.claude/skills/*/SKILL.md`，项目级覆盖用户级
+- 每个 skill 是子目录下的 `SKILL.md`，frontmatter 含 `name` / `description` / `when_to_use` / `allowed-tools` / `user-invocable` / `context`
+- 触发方式一：用户输入 `/skillname args`（REPL 直接触发）
+- 触发方式二：主 Agent 调用 `agent` 工具时通过 `skills` 参数显式传入，子 Agent 启动时自动注入
+- `allowed-tools`：skill 需要的工具列表，传给子 Agent 时会合并进其工具白名单
 - 上下文模式：`inline`（注入当前 Agent system prompt）/ `fork`（新建隔离子 Agent 执行）
 - 全局缓存，文件变更后自动重载
 
@@ -218,7 +220,6 @@ LLM 摘要失败时自动降级为 Snipping。
 | `system_prompt` | `str` | 子 Agent 的 SystemMessage（`.md` 正文） |
 | `allowed-tools` | `list[str]` | 工具白名单，空 = 继承全量 |
 | `disallowed-tools` | `list[str]` | 工具黑名单，未声明 = 默认 `[agent, enter_plan_mode, exit_plan_mode]` |
-| `skills` | `list[str]` | 注入的 skill 名称列表，空 = 不注入 |
 | `permission-mode` | `str` | 权限模式，空 = 继承父级 |
 | `model` | `str` | `"inherit"` = 沿用父级模型 |
 | `max-turns` | `int` | 最大交互轮次，默认 50 |
@@ -254,7 +255,6 @@ name: code-reviewer
 description: 代码审查专家，检查代码质量和潜在 bug
 allowed-tools: read_file, grep_search, write_file
 disallowed-tools:
-skills: code-review
 permission-mode: bypassPermissions
 model: inherit
 max-turns: 20
@@ -269,7 +269,19 @@ timeout-seconds: 600
 </guidelines>
 ```
 
-写完即可用 `agent(type="code-reviewer", prompt="...")` 调用。
+写完即可调用，如需 skill 能力由主 Agent 在调用时传入：
+
+```python
+agent(type="code-reviewer", prompt="...", skills=["code-review"])
+```
+
+**Skills 动态注入机制：**
+
+主 Agent 的 system prompt 中包含所有可用 skill 的目录（名称、描述、何时使用、需要哪些工具），主 Agent 根据任务性质自主决定传入哪些 skill。子 Agent 收到后：
+
+1. 从 `.claude/skills/` 扫描并加载对应 skill 的 prompt 内容
+2. 将 skill 声明的工具合并进白名单（若白名单为 None 即继承全量则无需合并）
+3. skill prompt 以 `<skill name="...">` 标签注入 system prompt 末尾
 
 ### 八、沙箱隔离（OpenSandbox）
 
@@ -553,7 +565,8 @@ uvx opensandbox-server
 
 ## 近期更新
 
-- 2026-06-11：子 Agent 系统重构 — 引入 `SubagentConfig` 数据类对齐 cc-haha/Deer Flow，所有 Agent 统一为 `agents/*.md` 文件定义（零硬编码），新增 `disallowed-tools` / `skills` / `permission-mode` / `timeout-seconds` 字段，三层加载优先级（包内置 → 用户 → 项目）
+- 2026-06-11：Skills 注入改为主 Agent 显式传入 — `agent` 工具新增 `skills` 参数，子 Agent 启动时自动合并 skill 工具集，`.md` 文件移除静态 `skills` 字段
+- 2026-06-11：子 Agent 系统重构 — 引入 `SubagentConfig` 数据类对齐 cc-haha/Deer Flow，所有 Agent 统一为 `agents/*.md` 文件定义（零硬编码），新增 `disallowed-tools` / `permission-mode` / `timeout-seconds` 字段，三层加载优先级（包内置 → 用户 → 项目）
 - 2026-06-11：优化Prompt Caching逻辑，完全对齐Claude Code官方实现，支持对话历史增量缓存，缓存命中率提升40%+
 - 2026-06-11：修复会话恢复功能，新增`as_node="agent"`参数解决状态更新异常问题
 - 2026-06-11：新增便捷启动脚本`run.sh`，预置Qwen后端配置，开箱即用

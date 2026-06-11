@@ -271,6 +271,7 @@ def build_graph(model: Any, max_turns: int = 100):
                 agent_type=args.get("type", "general"),
                 prompt=args.get("prompt", ""),
                 description=args.get("description", ""),
+                skills=args.get("skills") or [],
                 model=model,
                 parent_permission_mode=state.get("permission_mode", "default"),
             )
