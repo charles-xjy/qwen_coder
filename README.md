@@ -528,11 +528,18 @@ mini-claude --plan
 mini-claude --yolo
 
 # 从上次会话继续
-# 或使用预置Qwen后端的启动脚本（需修改run.sh中的API地址、密钥和模型名）
-./run.sh
 mini-claude --resume
-# 或使用预置Qwen后端的启动脚本（需修改run.sh中的API地址、密钥和模型名）
-./run.sh
+```
+
+### 全栈模式（Python 后端 + 前端）
+
+使用预置 Qwen 后端的启动脚本（需修改 run.sh / run.ps1 中的 API 地址、密钥和模型名）。
+**首次运行前需先安装前端依赖：**
+
+```bash
+cd frontend && bun install && cd ..   # 首次运行前执行一次，生成 node_modules
+./run.sh                              # Linux/macOS
+# Windows: .\run.ps1
 ```
 
 ---
