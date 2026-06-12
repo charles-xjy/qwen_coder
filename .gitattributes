@@ -1,0 +1,2 @@
+# Shell 脚本必须用 LF，否则在 Linux/macOS 上 shebang 失效
+*.sh text eol=lf

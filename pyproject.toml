@@ -13,6 +13,8 @@ dependencies = [
     "langchain-openai>=0.2",
     "rich>=13.0",
     "opensandbox",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]
