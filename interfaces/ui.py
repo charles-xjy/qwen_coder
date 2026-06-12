@@ -29,7 +29,7 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from skills import list_user_invocable_skills
+from features.skills import list_user_invocable_skills
 
 console = Console(highlight=False)
 
@@ -154,14 +154,14 @@ async def _cmd_compact(graph: Any, config: dict, model: Any) -> None:
         console.print("[dim]消息太少，无需压缩[/dim]")
         return
     with console.status("[cyan]正在压缩对话历史…[/cyan]"):
-        from compressor import _llm_summarize
+        from graph.compressor import _llm_summarize
         new_messages = await _llm_summarize(messages, model)
     await graph.update_state(config, {"messages": new_messages, "compress_choice": ""})
     console.print(f"[green]压缩完成：{len(messages)} 条 → {len(new_messages)} 条[/green]")
 
 
 async def _cmd_memory(graph: Any, config: dict) -> None:
-    from memory import list_memories
+    from features.memory import list_memories
     headers = list_memories()
     if not headers:
         console.print("[dim]暂无记忆[/dim]")
@@ -200,7 +200,7 @@ async def _cmd_resume(graph: Any, config: dict) -> "tuple[dict, str] | None":
     显示历史会话列表，方向键选择后恢复到 graph。
     返回 (new_config, new_session_id)，取消返回 None。
     """
-    from session import list_sessions, restore_session, make_thread_config
+    from features.session import list_sessions, restore_session, make_thread_config
 
     sessions = list_sessions()
     if not sessions:
@@ -374,7 +374,7 @@ async def stream_turn(
 
 async def _handle_interrupts(graph: Any, config: dict, session_id: str = "") -> None:
     """检查图是否因 interrupt() 暂停，弹出选择前先存档，然后 resume。"""
-    from session import save_turn
+    from features.session import save_turn
 
     while True:
         snap = await graph.aget_state(config)
@@ -504,7 +504,7 @@ async def run_repl(graph: Any, config: dict, model: Any, session_id: str = "") -
     交互式 REPL。
     /exit 或 Ctrl+C 退出。每轮结束后自动保存消息到 JSONL。
     """
-    from session import save_turn
+    from features.session import save_turn
 
     console.print(
         Panel(
@@ -559,7 +559,7 @@ async def run_once(graph: Any, config: dict, model: Any, prompt: str, session_id
     非交互式：执行一次 prompt，输出完整结果后退出。
     用于 `qwen-coder "帮我写一个快速排序"` 这种命令行调用。
     """
-    from session import save_turn
+    from features.session import save_turn
     try:
         await stream_turn(
             graph,

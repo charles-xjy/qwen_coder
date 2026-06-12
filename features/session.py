@@ -18,7 +18,7 @@ from typing import Any
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import messages_from_dict, messages_to_dict
 
-from tools import WORKDIR
+from core.tools import WORKDIR
 
 # ── 路径 ──────────────────────────────────────────────────────────────────────
 
@@ -161,7 +161,7 @@ def make_thread_config(session_id: str) -> dict:
 
 async def restore_session(app: Any, config: dict, session_id: str) -> None:
     """从 JSONL 加载消息和元数据，注入 MemorySaver。"""
-    from agent import make_initial_state
+    from graph.agent import make_initial_state
 
     messages = load_messages(session_id)
     meta     = load_session(session_id) or {}

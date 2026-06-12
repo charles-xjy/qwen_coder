@@ -21,7 +21,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-from tools import execute_tool, get_active_tool_definitions
+from core.tools import execute_tool, get_active_tool_definitions
 
 # ── 全局默认值（.md 文件未指定时使用）──────────────────────────────────────────
 _DEFAULT_DISALLOWED_TOOLS = ["agent", "enter_plan_mode", "exit_plan_mode"]
@@ -216,7 +216,7 @@ def _build_skill_injection(skill_names: list[str]) -> tuple[str, list[str]]:
 
     返回 (prompt_text, extra_tool_names)。
     """
-    from skills import discover_skills, resolve_skill_prompt
+    from features.skills import discover_skills, resolve_skill_prompt
 
     all_skills = discover_skills()
     parts: list[str] = []

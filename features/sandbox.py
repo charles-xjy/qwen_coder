@@ -14,7 +14,7 @@ import subprocess
 from datetime import timedelta
 from pathlib import Path
 
-from tools import WORKDIR
+from core.tools import WORKDIR
 
 # ── 配置（从环境变量读取，带默认值）────────────────────────────────────────────
 

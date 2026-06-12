@@ -28,13 +28,15 @@ dev = [
 [project.scripts]
 qwen-coder = "qwen_coder.__main__:main"
 
-# 项目文件全部在 D:\mycode\qwen_coder\ 根目录下（flat layout）
-# 告诉 setuptools：包名 qwen_coder 对应当前目录 "."
-[tool.setuptools.package-dir]
-"qwen_coder" = "."
-
-[tool.setuptools.packages]
-find = {where = [".."], include = ["qwen_coder"]}
+# 按功能分包（从源码运行：仓库根目录在 sys.path 上，子包以顶层名 core/graph/features/interfaces 导入）
+#   core/       基础层：state、tools
+#   graph/      Agent 运行时：agent、compressor、prompt、subagent
+#   features/   子系统：memory、skills、sandbox、session
+#   interfaces/ 接口层：ui、server
+#   __main__.py CLI 入口（保留在根目录）
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "graph*", "features*", "interfaces*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

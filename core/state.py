@@ -25,6 +25,7 @@ class AgentState(TypedDict):
 
     # Context compression
     compress_choice: str
+    messages_at_last_snip: int  # non-system 消息数，上次 snip 检查时的值
 
     # Long-term memory
     surfaced_memories: Set[str]

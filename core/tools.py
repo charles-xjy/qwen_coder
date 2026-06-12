@@ -346,7 +346,7 @@ async def _handle_save_memory(
 ) -> str:
     """保存一条长期记忆。"""
     try:
-        from memory import save_memory
+        from features.memory import save_memory
         path = save_memory(name, description, mem_type, content)
         return f"记忆已保存：{path.name}"
     except Exception as e:
@@ -356,7 +356,7 @@ async def _handle_save_memory(
 async def _handle_run_shell(command: str, timeout: int = 30) -> str:
     """通过 OpenSandbox 在沙箱中执行命令，详见 sandbox.py。"""
     try:
-        from sandbox import get_sandbox
+        from features.sandbox import get_sandbox
         return await get_sandbox().run(command, timeout=timeout)
     except Exception as e:
         return f"Error: {e}"

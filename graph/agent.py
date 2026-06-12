@@ -5,7 +5,7 @@ agent.py - LangGraph StateGraph 主图
   agent    → 构建 system prompt，调用 LLM
   tools    → 权限检查，执行工具调用，处理 plan_mode 切换
   warn     → interrupt() 询问用户是否压缩上下文
-  compress → 执行 snipping / micro-compact / LLM 摘要
+  compress → LLM 全量摘要（仅 85%+ 且用户确认时）
 
 路由：
   agent → END（无 tool_calls 或达到最大轮次）
@@ -15,6 +15,11 @@ agent.py - LangGraph StateGraph 主图
   warn  → compress（用户选"compress"）
   warn  → agent（用户跳过）
   compress → agent
+
+上下文压缩层次（在 agent_node 内按顺序执行）：
+  1. Time-based mic：距上次调用 > 5min（Qwen 缓存过期），清空旧工具结果内容
+  2. LLM snip：消息数 > 12 时，LLM 自行判断哪段冗余并局部折叠（如第5-13条→1条摘要）
+  3. Warn/compress：ratio > 75% 警告，> 85% 且确认后做全量 LLM 摘要
 """
 
 import asyncio
@@ -26,12 +31,17 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
-from compressor import _has_snippable_messages, _snip_messages, create_compress_node, create_warn_node, make_token_router, route_after_warn
-from memory import auto_save_memory
-from prompt import build_system_prompt
-from state import AgentState
-from subagent import handle_agent_tool
-from tools import check_permission, execute_tool, get_active_tool_definitions
+from graph.compressor import (
+    _usage_ratio, _SNIP_CHECK_INTERVAL,
+    maybe_time_based_mic, llm_snip_messages,
+    create_compress_node, create_warn_node, make_token_router, route_after_warn,
+)
+from langchain_core.messages import RemoveMessage
+from features.memory import auto_save_memory
+from graph.prompt import build_system_prompt
+from core.state import AgentState
+from graph.subagent import handle_agent_tool
+from core.tools import check_permission, execute_tool, get_active_tool_definitions
 
 
 # ── 工具 Schema → LangChain 格式 ─────────────────────────────────────────────
@@ -156,11 +166,30 @@ def build_graph(model: Any, max_turns: int = 100):
         )
 
         # system message 不进 state，只在调用时临时拼接
-        # 支持显式缓存的 provider：给对话历史打缓存标记（仅1个，对齐Claude Code实现）
-        from prompt import _supports_explicit_cache
+        from graph.prompt import _supports_explicit_cache
         history = list(state["messages"])
-        if _has_snippable_messages(history):
-            history = _snip_messages(history)
+
+        # ── Time-based mic：Qwen 缓存已失效（>5min），清空旧工具结果，减少重写量
+        mic_result = maybe_time_based_mic(history, state.get("last_api_call_time", 0))
+        if mic_result is not None:
+            history = mic_result
+
+        # ── LLM snip：每积累 20 条 non-system 消息触发一次，LLM 自行判断哪段冗余
+        snip_removes: list = []
+        non_system_count = sum(1 for m in history if not isinstance(m, SystemMessage))
+        last_snip_at = state.get("messages_at_last_snip", 0) or 0
+        snip_extra: dict = {}
+        if non_system_count - last_snip_at >= _SNIP_CHECK_INTERVAL:
+            snipped, did_snip = await llm_snip_messages(history, model)
+            if did_snip:
+                old_ids = {m.id for m in history if getattr(m, "id", None)}
+                new_ids = {m.id for m in snipped if getattr(m, "id", None)}
+                snip_removes = [RemoveMessage(id=mid) for mid in old_ids - new_ids]
+                snip_removes += [m for m in snipped if not getattr(m, "id", None)]
+                history = snipped
+            # 无论是否实际压缩，都重置计数器（避免无冗余时每轮都检查）
+            snip_extra = {"messages_at_last_snip": non_system_count}
+
         history = _apply_history_cache_markers(history) if _supports_explicit_cache(model) else history
         messages_for_llm = [SystemMessage(content=prompt)] + history
 
@@ -179,7 +208,7 @@ def build_graph(model: Any, max_turns: int = 100):
         output_tokens = usage.get("output_tokens", 0)
 
         return {
-            "messages": [response],
+            "messages": snip_removes + [response],
             "current_turns": turns + 1,
             "last_api_call_time": time.time(),
             "last_input_token_count": input_tokens,
@@ -187,6 +216,7 @@ def build_graph(model: Any, max_turns: int = 100):
             "total_output_tokens": (state.get("total_output_tokens") or 0) + output_tokens,
             "surfaced_memories": (state.get("surfaced_memories") or set()) | newly_surfaced,
             "session_memory_bytes": (state.get("session_memory_bytes") or 0) + bytes_added,
+            **snip_extra,
         }
 
     # ── tools 节点 ───────────────────────────────────────────────────────────
@@ -355,6 +385,7 @@ def make_initial_state(permission_mode: str = "default") -> dict:
         "last_api_call_time": 0.0,
         "current_turns": 0,
         "compress_choice": "",
+        "messages_at_last_snip": 0,
         "surfaced_memories": set(),
         "session_memory_bytes": 0,
     }

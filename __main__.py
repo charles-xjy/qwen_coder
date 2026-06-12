@@ -165,7 +165,7 @@ def _build_model(args: argparse.Namespace):
 # ── 会话列表展示 ──────────────────────────────────────────────────────────────
 
 def _print_sessions() -> None:
-    from session import list_sessions
+    from features.session import list_sessions
     sessions = list_sessions()
     if not sessions:
         console.print("[dim]暂无历史会话[/dim]")
@@ -191,7 +191,7 @@ def _print_sessions() -> None:
 # ── 会话 ID 解析 ──────────────────────────────────────────────────────────────
 
 def _resolve_session_id(resume_arg: str | None) -> str:
-    from session import get_latest_session_id, new_session_id
+    from features.session import get_latest_session_id, new_session_id
 
     if resume_arg is None:
         sid = new_session_id()
@@ -207,7 +207,7 @@ def _resolve_session_id(resume_arg: str | None) -> str:
         return sid
 
     # 指定了具体 session_id
-    from session import load_session
+    from features.session import load_session
     if load_session(resume_arg):
         console.print(f"[dim]恢复会话：{resume_arg}[/dim]")
         return resume_arg
@@ -231,8 +231,8 @@ async def _save_title(session_id: str, model, graph, config: dict) -> None:
         )
         if not first_human:
             return
-        from prompt import generate_session_title
-        from session import update_title
+        from graph.prompt import generate_session_title
+        from features.session import update_title
         title = await generate_session_title(first_human, model)
         update_title(session_id, title)
     except Exception:
@@ -254,9 +254,9 @@ async def _main() -> None:
 
     session_id      = _resolve_session_id(args.resume)
 
-    from agent import build_graph, make_initial_state
-    from session import get_checkpointer, make_thread_config, restore_session, save_session
-    from ui import run_once, run_repl
+    from graph.agent import build_graph, make_initial_state
+    from features.session import get_checkpointer, make_thread_config, restore_session, save_session
+    from interfaces.ui import run_once, run_repl
 
     config      = make_thread_config(session_id)
     checkpointer = get_checkpointer()   # MemorySaver，无需 async with
@@ -279,7 +279,7 @@ async def _main() -> None:
             await run_repl(app, config, model, session_id)
     finally:
         await _save_title(session_id, model, app, config)
-        from memory import increment_dream_session, trigger_dream
+        from features.memory import increment_dream_session, trigger_dream
         increment_dream_session()
         await trigger_dream(model)
 

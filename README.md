@@ -26,16 +26,14 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ### 3. 四级上下文压缩与 Token 管理
 
-压缩和缓存是一条连续流水线：
+压缩遵循「先丢可再生资源，最后才动不可再生内容」原则，四级从轻到重：
 
-1. 工具层先做预算截断，超长结果在 `tools.py` 里先裁掉。
-2. `agent` 重新组 prompt 时，先决定 system prompt 和缓存前缀怎么拼。
-3. 如果历史里有旧的可再生工具结果，就先做 Snipping。
-4. 如果长时间空闲，再升级到 Micro-compact。
-5. 如果上下文仍然过大，且用户确认压缩，再走 LLM 结构化摘要。
-6. 压缩完成后回到 agent，重新发起下一轮推理，同时重建缓存前缀。
+1. **预算截断**（`core/tools.py` 内实时发生）：单个工具结果 >10000 字符时直接截断，保留头尾、中间打 `...[truncated]` 标记，文件仍在磁盘可按需重读。
+2. **Time-based Micro-compact**（空闲 >5 分钟）：Qwen 计费缓存 TTL 为 5 分钟，超时即视为缓存失效——反正要重写前缀，不如顺手把旧的可再生工具结果内容清空，保留最近 5 条。只改本轮发送的 history 副本，不写回 state（对齐 cc-haha 的 time-based microcompact，触发条件从 Anthropic 的 1h cache TTL 改为 Qwen 的 5min）。
+3. **LLM Snip**（每积累 20 条消息触发一次）：不看 token 使用率，而是和 cc-haha 一样**让模型自己判断**哪段历史冗余。LLM 返回要折叠的消息序号区间 `[start, end]` 和该区间的摘要，只把这一段折叠成 1 条摘要消息，其余消息**原封不动**（例如 30 条里 LLM 认为第 5–13 条冗余，就把这 9 条换成 1 条摘要，剩下 21 条保持原样）。最近 6 条永不参与压缩。
+4. **LLM 全量摘要**（使用率 >85% 且用户确认）：`warn` 节点 `interrupt()` 询问用户，确认后把全部历史折叠为 1 条结构化摘要（对齐 cc-haha `compactConversation`，9 段式：主要请求/技术要点/文件代码/错误修复/问题解决/全部用户消息/待续事项/当前工作/下一步）。
 
-这套流程遵循「先丢可再生资源，最后才动不可再生内容」原则：工具结果预算截断（单结果 >10000 字符）→ Snipping（在下一次重建 system prompt / cache 前缀时，对旧可再生工具结果做 id-in-place 占位替换）→ Micro-compact（空闲 >5 分钟，清空所有旧 ToolMessage）→ LLM 结构化摘要（使用率 >85% 且用户确认，早期对话压缩为任务背景/已完成工作/关键决策/当前状态/待续事项）。全程追踪从首 token 到当轮的 token 消耗，结合 Prompt Caching（`cache_control: {type: "ephemeral"}` 稳定/动态前缀分离）将缓存命中成本降至 0.1×。
+结合 Prompt Caching（`cache_control: {type: "ephemeral"}` 稳定/动态前缀分离）将缓存命中成本降至 0.1×。
 
 ### 4. 远程沙箱安全执行
 
@@ -87,9 +85,9 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ### 四、上下文压缩（4 级）
 
-压缩遵循"先丢可再生资源，最后才动不可再生内容"的原则，4 级从轻到重依次触发：
+压缩遵循"先丢可再生资源，最后才动不可再生内容"的原则，4 级从轻到重依次触发。Snip 和 Micro-compact 都在 `agent_node` 调用 LLM 前执行。
 
-#### 级别 1：预算截断（tools.py 内实时发生）
+#### 级别 1：预算截断（core/tools.py 内实时发生）
 
 单个工具结果超过 10000 字符时，`execute_tool()` 在返回前直接截断，保留头部 2500 字符 + 尾部 500 字符，中间加 `...[truncated]` 标记。Agent 看到截断标记后可以用 `read_file` 加 `offset` 参数重新读取所需的特定行范围。
 
@@ -97,96 +95,88 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 - 信息损失：中间部分丢失，但文件仍在磁盘，可按需重读
 - 对 Agent 透明：截断结果直接写入 ToolMessage，Agent 只看到截断版
 
-#### 级别 2：Snipping（使用率 > 60%）
+#### 级别 2：Time-based Micro-compact（空闲 > 5 分钟）
 
-在**下一次重建 system prompt / cache 前缀**时，把历史消息中**较早的可再生工具结果**替换为占位符，保留最近 3 条 ToolMessage 不动。
+对齐 cc-haha 的 time-based microcompact：Qwen 计费缓存 TTL 是 5 分钟，距上次 API 调用超过 5 分钟时，缓存几乎必然已失效——反正下一轮要重写整个前缀，不如趁机把旧的**可再生工具结果**内容清空，减少要重写的体积。
 
-可截断工具（幂等操作，结果可重新获取）：`read_file` / `grep_search` / `list_files` / `run_shell` / `web_fetch`
-
-```
-替换前：
-  [工具结果①] "def main(): ..."   # read_file，旧
-  [工具结果②] "import os..."      # grep_search，旧
-  [工具结果③] "def helper()..."   # 最近3条：保留
-  [工具结果④] "DEBUG = True..."   # 保留
-  [工具结果⑤] "test passed"       # 保留
-
-替换后：
-  [工具结果①] "[内容已压缩 — 如需查看请重新调用工具]"
-  [工具结果②] "[内容已压缩 — 如需查看请重新调用工具]"
-  [工具结果③] "def helper()..."   # 不动
-  [工具结果④] "DEBUG = True..."   # 不动
-  [工具结果⑤] "test passed"       # 不动
-```
-
-实现细节：使用 `msg.model_copy(update={"content": placeholder})` 保留原 message id，LangGraph 的 `add_messages` reducer 识别到相同 id 时执行 update-in-place，不追加新消息。这样 Snipping 就和缓存重写绑定，而不是和 `warn` 节点绑定。
-
-#### 级别 3：Micro-compact（空闲 > 5 分钟）
-
-Agent 检测到上次 API 调用距今超过 5 分钟时，触发比 Snipping 更激进的清理：**所有旧 ToolMessage 都替换为占位符**，不区分工具类型，只保留最近 3 条。
-
-适合用户暂时离开、Agent 等待输入的场景，趁空闲释放 token。
-
-#### 级别 4：LLM 摘要（使用率 > 75%，用户确认）
-
-使用率超过 75% 时，`warn 节点` 通过 `interrupt()` 弹出提示，询问用户是否立即压缩。用户选择"压缩"且使用率 > 85% 时，进入 LLM 摘要：
-
-1. 把早期对话（除最后 4 条外）发给 LLM
-2. LLM 输出结构化摘要（任务背景 / 已完成工作 / 关键决策 / 当前状态 / 待续事项）
-3. 用 `RemoveMessage` 删除原始消息，插入摘要消息
+- 触发条件：`now - last_api_call_time > 300s`
+- 操作对象：可再生工具结果（`read_file` / `grep_search` / `list_files` / `run_shell` / `web_fetch`），保留最近 5 条
+- 关键差异：**只修改本轮发送给 LLM 的 history 副本，不写回 state**（缓存已失效，无需持久化改动）
 
 ```
-压缩前（几十条对话）：
-  [用户] 帮我重构这个项目
-  [AI]   好的，我先分析...（一大段分析）
-  [工具] ...（大量工具结果）
-  ... 几十条 ...
-  [用户] 现在测试一下           ← 最后4条保留
-  [AI]   调用 run_shell
-  [工具] test passed
-  [AI]   测试通过
+清理前：
+  [read_file 结果] "def main(): ..."   # 旧
+  [grep 结果]      "import os..."      # 旧
+  ... 最近 5 条可再生结果保留 ...
 
-压缩后：
-  [摘要] 任务背景：重构项目，重点 main.py
-         已完成：拆分了3个函数，修改了 utils.py
-         关键决策：用工厂模式替代 if-else
-         当前状态：代码已写完，正在测试
-         待续：还需要更新文档
-
-  [用户] 现在测试一下           ← 原样保留
-  [AI]   调用 run_shell
-  [工具] test passed
-  [AI]   测试通过
+清理后：
+  [read_file 结果] "[缓存已失效，旧结果已清理]"
+  [grep 结果]      "[缓存已失效，旧结果已清理]"
+  ... 最近 5 条不动 ...
 ```
 
-LLM 摘要失败时自动降级为 Snipping。
+#### 级别 3：LLM Snip（每积累 20 条消息触发一次）
+
+这是和 cc-haha 一致的核心机制：**不看 token 使用率，让模型自己判断哪段历史冗余**。每当 non-system 消息数比上次检查时又多了 20 条，就把整段历史（带序号）发给 LLM，让它判断：
+
+1. 是否需要压缩？不需要则返回 `{"needed": false}`，本轮跳过
+2. 需要的话，返回要折叠的消息序号区间 `[start, end]` 和这段的摘要
+
+只把 `[start, end]` 这一段折叠成 **1 条摘要消息**，区间外的消息**原封不动**。最近 6 条消息永不参与压缩（即使 LLM 给了越界序号也会被强制裁回）。
+
+```
+压缩前（30 条消息）：
+  [0] 用户：做个项目
+  [1] AI：读 package.json
+  [2] 工具结果：...
+  ...
+  [5-13] 一堆探索性的读文件 / grep / 架构讨论   ← LLM 判定这段冗余
+  ...
+  [29] 用户：继续补登录
+
+压缩后（22 条消息）：
+  [0] 用户：做个项目
+  [1] AI：读 package.json
+  [2] 工具结果：...
+  [对话历史摘要（原第 5–13 条已折叠）] 读了 X，发现 Y，决定用 Z 方案...
+  ...                                              ← 其余 21 条原封不动
+  [29] 用户：继续补登录
+```
+
+实现：用 `RemoveMessage` 删除被折叠的旧消息，插入 1 条摘要 `HumanMessage`，通过 `messages_at_last_snip` 计数器控制 20 条的检查间隔（不论是否实际压缩都重置计数器，避免无冗余时每轮都问 LLM）。
+
+#### 级别 4：LLM 全量摘要（使用率 > 75%，用户确认）
+
+使用率超过 75% 时，`warn 节点` 通过 `interrupt()` 弹出提示，询问用户是否立即压缩。用户选择"压缩"且使用率 > 85% 时，进入全量摘要——对齐 cc-haha 的 `compactConversation`：
+
+1. 把**全部历史**发给 LLM（不保留任何原始消息）
+2. LLM 输出 9 段式结构化摘要（主要请求 / 技术要点 / 文件代码 / 错误修复 / 问题解决 / 全部用户消息 / 待续事项 / 当前工作 / 下一步），先用 `<analysis>` 草稿分析再输出 `<summary>`
+3. 用 `RemoveMessage` 删除所有原始消息，只留 1 条摘要消息
+
+> 注：cc-haha 全量压缩后还会把会话期间读过的文件（最多 5 个）重新读一遍注入回来（attachment），本项目暂未实现这一步，压缩后模型如需文件内容自行 `read_file` 重读即可。
 
 #### 压缩流程总览
 
 ```
-每轮 tools 节点执行完
+agent_node 调用 LLM 前：
+   ① Time-based mic：空闲 >5min → 清空旧工具结果（改本地副本）
+   ② LLM snip：消息数比上次 +20 → 问 LLM 哪段冗余 → 局部折叠（写回 state）
         ↓
-   token_router 检查使用率
+   调用 LLM → tools 节点执行 → token_router 检查使用率
         ↓
-< 75%  → agent（Snipping 在 agent 重写 prompt/cache 时自动触发，micro-compact 在 compress 节点内按条件触发）
-   ≥ 75%  → warn 节点
+   < 75%  → 继续循环
+   ≥ 75%  → warn 节点 interrupt() "使用率 78%，是否压缩？"
         ↓
-   warn 节点：interrupt() 弹出提示
-   "上下文使用率 78%，是否立即压缩？"
-        ↓
-   用户选"压缩" → compress 节点
-     ├─ 使用率 > 85%：LLM 摘要
-     ├─ 空闲 > 5 分钟：micro-compact
-└─ 其他：snipping（在下一次 prompt/cache 重写时执行）
-   用户选"跳过" → agent（继续工作）
+   用户选"压缩" + 使用率 >85% → compress 节点全量 LLM 摘要
+   用户选"跳过" → 继续循环
 ```
 
 | 级别 | 触发时机 | 操作对象 | 实现机制 |
 |---|---|---|---|
 | **预算截断** | 单个工具结果 > 10000 字符 | 工具返回值 | 直接截断字符串 |
-| **Snipping** | 使用率 > 60% | 旧的可再生工具结果 | `model_copy` 保留 id，update-in-place |
-| **Micro-compact** | 空闲 > 5 分钟 | 所有旧工具结果 | `model_copy` 保留 id，update-in-place |
-| **LLM 摘要** | 使用率 > 85% + 用户确认 | 早期对话文本 | `RemoveMessage` 删除 + 插入摘要 |
+| **Time-based mic** | 空闲 > 5 分钟（Qwen 缓存 TTL） | 旧的可再生工具结果，保留最近 5 条 | 改本地 history 副本，不写 state |
+| **LLM snip** | 每积累 20 条消息 | LLM 判定的冗余区间 | LLM 决定区间 → `RemoveMessage` 局部折叠为 1 条摘要 |
+| **LLM 全量摘要** | 使用率 > 85% + 用户确认 | 全部历史 | `RemoveMessage` 删除全部 + 插入 1 条摘要 |
 
 ### 五、文件记忆系统
 
@@ -382,7 +372,7 @@ OpenAI 对超过 1024 token 的输入自动缓存前缀，无需额外参数。�
 
 **压缩与缓存的矛盾：**
 
-上下文压缩（snipping / micro-compact / LLM 摘要）和前缀缓存命中是互斥的——缓存本质是按前缀哈希索引的 KV，是只读的，改写历史消息意味着前缀字节变化，已缓存内容全部失效，没有任何 provider 提供"原地修改缓存"的 API。这个项目现在把 Snipping 放在**重建 prompt/cache 的时刻**执行，就是为了尽量把“压缩”和“重新写缓存”合并成一次前缀重建。
+上下文压缩（time-based mic / LLM snip / LLM 全量摘要）和前缀缓存命中是互斥的——缓存本质是按前缀哈希索引的 KV，是只读的，改写历史消息意味着前缀字节变化，已缓存内容全部失效，没有任何 provider 提供"原地修改缓存"的 API。本项目的应对：**time-based mic 专挑缓存已失效的时机（空闲 >5min，Qwen 缓存 TTL 过期）执行**——此时前缀本来就要重写，清理工具结果不额外付费；**LLM snip 攒够 20 条才检查一次**，把多次小压缩批量成一次前缀重建，避免零敲碎打反复付重建费。
 
 ```
 第 1 轮：[system][tools][消息1][read_file: 12KB 全文][AI回复1]  ← 前缀被缓存
@@ -398,7 +388,7 @@ OpenAI 对超过 1024 token 的输入自动缓存前缀，无需额外参数。�
 | **客户端编辑** | cc-haha / 本项目 | 客户端自己改消息数组，批量化压缩控制失效代价 |
 | **服务端编辑** | Anthropic context editing | 把清理逻辑搬进 API，`clear_at_least` 参数保证每次清除量"值回票价" |
 
-Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版的 micro-compact：API 自动按时间顺序清除最旧的工具结果，替换成占位符——和本项目 `compressor.py` 的 snipping 逻辑等价，只是搬到了服务端。官方文档也明确说：清除 = 缓存失效，所以提供了 `clear_at_least` 参数，让你攒够一批再清，别零敲碎打地反复付重建费。
+Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版的 micro-compact：API 自动按时间顺序清除最旧的工具结果，替换成占位符——和本项目 `graph/compressor.py` 的 time-based mic 逻辑等价，只是搬到了服务端。官方文档也明确说：清除 = 缓存失效，所以提供了 `clear_at_least` 参数，让你攒够一批再清，别零敲碎打地反复付重建费——本项目的「攒够 20 条才 snip」是同一思路的客户端实现。
 
 本项目使用 OpenAI 兼容接口（Qwen），没有服务端编辑 API，压缩触发时接受一次缓存失效。取舍是：**平时靠稳定前缀省钱，context 快满时接受一次失效换空间**，整体仍然划算。
 
@@ -424,6 +414,8 @@ Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版�
 │  │  agent 节点                                          │        │
 │  │  - 加载 Memory（sideQuery 检索相关记忆注入 system）   │        │
 │  │  - 加载 Skills 目录（热更新）                        │        │
+│  │  - Time-based mic（空闲>5min 清旧工具结果）           │        │
+│  │  - LLM snip（每+20条问 LLM 哪段冗余，局部折叠）       │        │
 │  │  - 调用 LLM（流式）                                  │        │
 │  └──────────────┬───────────────────────────────────────┘        │
 │                 │                                                 │
@@ -451,8 +443,8 @@ Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版�
 │  └────────┬─────────┘   compress ▼                              │
 │           │          ┌──────────────────────────────┐           │
 │     approve ──→      │  compress 节点               │           │
-│     deny ──→ agent   │  Snipping：清理旧 tool result │           │
-│                      │  LLM 摘要：压缩早期对话       │           │
+│     deny ──→ agent   │  LLM 全量摘要：全部历史       │           │
+│                      │  折叠为 1 条结构化摘要        │           │
 │                      └──────────┬───────────────────┘           │
 │                                 │                               │
 │                     ◀───────────┘ → agent（循环）               │
@@ -485,19 +477,29 @@ Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版�
 
 ```
 qwen_coder/
-├── __main__.py      # CLI 入口，argparse，REPL / 一次性模式
-├── agent.py         # LangGraph StateGraph 定义，节点逻辑，路由函数
-├── tools.py         # 10 工具定义 + 权限检查 + deferred 机制 + execute_tool()
-├── sandbox.py       # OpenSandbox 会话级单例，文件上传同步，降级策略
-├── subagent.py      # SubagentConfig 配置模型 + 轻量 for-loop 执行引擎
-├── agents/          # 子 Agent 定义（.md 文件，包内置为 explore/plan/general）
-├── memory.py        # 文件记忆读写，MEMORY.md 索引，sideQuery 检索
-├── skills.py        # SKILL.md 加载，/cmd 解析，prompt 注入
-├── session.py       # 会话 JSON 索引，LangGraph checkpointer 封装
-├── compressor.py    # 4 级压缩：预算截断 → snip → micro-compact → LLM 摘要
-├── prompt.py        # system prompt 构建，记忆 / todo / skill 注入
-├── ui.py            # rich 终端渲染，spinner，diff 高亮，工具调用展示
-└── state.py         # AgentState TypedDict 定义
+├── __main__.py          # CLI 入口，argparse，REPL / 一次性模式（保留在根）
+│
+├── core/                # 基础层（被所有人依赖）
+│   ├── state.py         # AgentState TypedDict 定义
+│   └── tools.py         # 10 工具定义 + 权限检查 + deferred 机制 + execute_tool()
+│
+├── graph/               # Agent 运行时（LangGraph）
+│   ├── agent.py         # StateGraph 定义，节点逻辑，路由函数
+│   ├── compressor.py    # 上下文压缩：time-based mic → LLM snip → LLM 全量摘要
+│   ├── prompt.py        # system prompt 构建，记忆 / todo / skill 注入
+│   └── subagent.py      # SubagentConfig 配置模型 + 轻量 for-loop 执行引擎
+│
+├── features/            # 子系统
+│   ├── memory.py        # 文件记忆读写，MEMORY.md 索引，sideQuery 检索
+│   ├── skills.py        # SKILL.md 加载，/cmd 解析，prompt 注入
+│   ├── sandbox.py       # OpenSandbox 会话级单例，文件上传同步，降级策略
+│   └── session.py       # 会话 JSON 索引，LangGraph checkpointer 封装
+│
+├── interfaces/          # 接口层
+│   ├── ui.py            # rich 终端渲染，spinner，diff 高亮，工具调用展示
+│   └── server.py        # FastAPI + SSE 服务，astream_events → 前端事件流
+│
+└── agents/              # 子 Agent 定义（.md 文件，内置 explore/plan/general）
 ```
 
 ---
@@ -593,6 +595,7 @@ uvx opensandbox-server
 
 ## 近期更新
 
+- 2026-06-12：上下文压缩重构对齐 cc-haha — Snip 改为 **LLM 自主判断**冗余区间并局部折叠（每 20 条消息检查一次，只压 `[start,end]` 区间为 1 条摘要，其余原封不动），不再按 token 阈值机械裁剪；Micro-compact 改为 time-based（空闲 >5min = Qwen 计费缓存 TTL 过期触发，只改本地副本）；LLM 全量摘要对齐 `compactConversation` 9 段式结构，折叠全部历史为 1 条
 - 2026-06-11：新增 AutoDream 定期记忆整合 — 双门槛（≥24h + ≥5会话）触发，会话结束时自动合并重复、删除过时记忆；新增 auto_save_memory fire-and-forget，每轮最终回复后后台分析是否需要写入长期记忆
 - 2026-06-11：Skills 注入改为主 Agent 显式传入 — `agent` 工具新增 `skills` 参数，子 Agent 启动时自动合并 skill 工具集，`.md` 文件移除静态 `skills` 字段
 - 2026-06-11：子 Agent 系统重构 — 引入 `SubagentConfig` 数据类对齐 cc-haha/Deer Flow，所有 Agent 统一为 `agents/*.md` 文件定义（零硬编码），新增 `disallowed-tools` / `permission-mode` / `timeout-seconds` 字段，三层加载优先级（包内置 → 用户 → 项目）

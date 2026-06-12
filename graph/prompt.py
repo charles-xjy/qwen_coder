@@ -20,9 +20,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from skills import build_skill_catalog
-from memory import get_memories_for_prompt, load_memory_index
-from state import AgentState
+from features.skills import build_skill_catalog
+from features.memory import get_memories_for_prompt, load_memory_index
+from core.state import AgentState
 
 # ── 核心身份 ──────────────────────────────────────────────────────────────────
 
@@ -113,7 +113,7 @@ def _get_git_context() -> str:
     """获取当前 git 状态：分支、最近 3 条 commit、工作区变更摘要。"""
     try:
         def _run(cmd: list[str]) -> str:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
             return r.stdout.strip() if r.returncode == 0 else ""
 
         branch  = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
