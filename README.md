@@ -26,7 +26,16 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 ### 3. 四级上下文压缩与 Token 管理
 
-递进式压缩策略，遵循「先丢可再生资源，最后才动不可再生内容」原则：预算截断（单结果 >15KB）→ Snipping（使用率 >60%，id-in-place 替换旧工具结果为占位符）→ Micro-compact（空闲 >5 分钟，清空所有旧 ToolMessage）→ LLM 结构化摘要（使用率 >85% 且用户确认，早期对话压缩为任务背景/已完成工作/关键决策/当前状态/待续事项）。全程追踪从首 token 到当轮的 token 消耗，结合 Prompt Caching（`cache_control: {type: "ephemeral"}` 稳定/动态前缀分离）将缓存命中成本降至 0.1×。
+压缩和缓存是一条连续流水线：
+
+1. 工具层先做预算截断，超长结果在 `tools.py` 里先裁掉。
+2. `agent` 重新组 prompt 时，先决定 system prompt 和缓存前缀怎么拼。
+3. 如果历史里有旧的可再生工具结果，就先做 Snipping。
+4. 如果长时间空闲，再升级到 Micro-compact。
+5. 如果上下文仍然过大，且用户确认压缩，再走 LLM 结构化摘要。
+6. 压缩完成后回到 agent，重新发起下一轮推理，同时重建缓存前缀。
+
+这套流程遵循「先丢可再生资源，最后才动不可再生内容」原则：工具结果预算截断（单结果 >10000 字符）→ Snipping（在下一次重建 system prompt / cache 前缀时，对旧可再生工具结果做 id-in-place 占位替换）→ Micro-compact（空闲 >5 分钟，清空所有旧 ToolMessage）→ LLM 结构化摘要（使用率 >85% 且用户确认，早期对话压缩为任务背景/已完成工作/关键决策/当前状态/待续事项）。全程追踪从首 token 到当轮的 token 消耗，结合 Prompt Caching（`cache_control: {type: "ephemeral"}` 稳定/动态前缀分离）将缓存命中成本降至 0.1×。
 
 ### 4. 远程沙箱安全执行
 
@@ -82,7 +91,7 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 #### 级别 1：预算截断（tools.py 内实时发生）
 
-单个工具结果超过 15KB 时，`execute_tool()` 在返回前直接截断，保留头部 25000 字符 + 尾部 5000 字符，中间加 `...[truncated]` 标记。Agent 看到截断标记后可以用 `read_file` 加 `offset` 参数重新读取所需的特定行范围。
+单个工具结果超过 10000 字符时，`execute_tool()` 在返回前直接截断，保留头部 2500 字符 + 尾部 500 字符，中间加 `...[truncated]` 标记。Agent 看到截断标记后可以用 `read_file` 加 `offset` 参数重新读取所需的特定行范围。
 
 - 触发时机：每次工具调用，实时处理
 - 信息损失：中间部分丢失，但文件仍在磁盘，可按需重读
@@ -90,7 +99,7 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
 
 #### 级别 2：Snipping（使用率 > 60%）
 
-把历史消息中**较早的可再生工具结果**替换为占位符，保留最近 3 条 ToolMessage 不动。
+在**下一次重建 system prompt / cache 前缀**时，把历史消息中**较早的可再生工具结果**替换为占位符，保留最近 3 条 ToolMessage 不动。
 
 可截断工具（幂等操作，结果可重新获取）：`read_file` / `grep_search` / `list_files` / `run_shell` / `web_fetch`
 
@@ -110,7 +119,7 @@ mini_claude 用纯 asyncio 手写了一个完整的 Claude Code 克隆。本项�
   [工具结果⑤] "test passed"       # 不动
 ```
 
-实现细节：使用 `msg.model_copy(update={"content": placeholder})` 保留原 message id，LangGraph 的 `add_messages` reducer 识别到相同 id 时执行 update-in-place，不追加新消息。
+实现细节：使用 `msg.model_copy(update={"content": placeholder})` 保留原 message id，LangGraph 的 `add_messages` reducer 识别到相同 id 时执行 update-in-place，不追加新消息。这样 Snipping 就和缓存重写绑定，而不是和 `warn` 节点绑定。
 
 #### 级别 3：Micro-compact（空闲 > 5 分钟）
 
@@ -159,7 +168,7 @@ LLM 摘要失败时自动降级为 Snipping。
         ↓
    token_router 检查使用率
         ↓
-   < 75%  → agent（Snipping/micro-compact 在 compress 节点内按条件触发）
+< 75%  → agent（Snipping 在 agent 重写 prompt/cache 时自动触发，micro-compact 在 compress 节点内按条件触发）
    ≥ 75%  → warn 节点
         ↓
    warn 节点：interrupt() 弹出提示
@@ -168,13 +177,13 @@ LLM 摘要失败时自动降级为 Snipping。
    用户选"压缩" → compress 节点
      ├─ 使用率 > 85%：LLM 摘要
      ├─ 空闲 > 5 分钟：micro-compact
-     └─ 其他：snipping
+└─ 其他：snipping（在下一次 prompt/cache 重写时执行）
    用户选"跳过" → agent（继续工作）
 ```
 
 | 级别 | 触发时机 | 操作对象 | 实现机制 |
 |---|---|---|---|
-| **预算截断** | 单个工具结果 > 15KB | 工具返回值 | 直接截断字符串 |
+| **预算截断** | 单个工具结果 > 10000 字符 | 工具返回值 | 直接截断字符串 |
 | **Snipping** | 使用率 > 60% | 旧的可再生工具结果 | `model_copy` 保留 id，update-in-place |
 | **Micro-compact** | 空闲 > 5 分钟 | 所有旧工具结果 | `model_copy` 保留 id，update-in-place |
 | **LLM 摘要** | 使用率 > 85% + 用户确认 | 早期对话文本 | `RemoveMessage` 删除 + 插入摘要 |
@@ -373,7 +382,7 @@ OpenAI 对超过 1024 token 的输入自动缓存前缀，无需额外参数。�
 
 **压缩与缓存的矛盾：**
 
-上下文压缩（snipping / micro-compact / LLM 摘要）和前缀缓存命中是互斥的——缓存本质是按前缀哈希索引的 KV，是只读的，改写历史消息意味着前缀字节变化，已缓存内容全部失效，没有任何 provider 提供"原地修改缓存"的 API。
+上下文压缩（snipping / micro-compact / LLM 摘要）和前缀缓存命中是互斥的——缓存本质是按前缀哈希索引的 KV，是只读的，改写历史消息意味着前缀字节变化，已缓存内容全部失效，没有任何 provider 提供"原地修改缓存"的 API。这个项目现在把 Snipping 放在**重建 prompt/cache 的时刻**执行，就是为了尽量把“压缩”和“重新写缓存”合并成一次前缀重建。
 
 ```
 第 1 轮：[system][tools][消息1][read_file: 12KB 全文][AI回复1]  ← 前缀被缓存
@@ -427,7 +436,7 @@ Anthropic 的 **context editing**（`clear_tool_uses` 策略）是服务端版�
 │  │  - 逐个检查 permission_mode vs 工具危险等级          │        │
 │  │  - deferred 工具检测（未激活则拒绝并提示 tool_search）│        │
 │  │  - 并发执行已批准工具                                │        │
-│  │  - 大结果（>15KB）截断 / 持久化到磁盘                │        │
+│  │  - 大结果（>10000字符）截断 / 持久化到磁盘            │        │
 │  └──────────┬──────────────┬───────────────────────────┘        │
 │             │              │                                     │
 │      需要权限确认?      context 使用率?                          │

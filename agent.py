@@ -17,6 +17,7 @@ agent.py - LangGraph StateGraph 主图
   compress → agent
 """
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -25,7 +26,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
-from compressor import create_compress_node, create_warn_node, make_token_router, route_after_warn
+from compressor import _has_snippable_messages, _snip_messages, create_compress_node, create_warn_node, make_token_router, route_after_warn
+from memory import auto_save_memory
 from prompt import build_system_prompt
 from state import AgentState
 from subagent import handle_agent_tool
@@ -156,15 +158,20 @@ def build_graph(model: Any, max_turns: int = 100):
         # system message 不进 state，只在调用时临时拼接
         # 支持显式缓存的 provider：给对话历史打缓存标记（仅1个，对齐Claude Code实现）
         from prompt import _supports_explicit_cache
-        history = (
-            _apply_history_cache_markers(list(state["messages"]))
-            if _supports_explicit_cache(model)
-            else list(state["messages"])
-        )
+        history = list(state["messages"])
+        if _has_snippable_messages(history):
+            history = _snip_messages(history)
+        history = _apply_history_cache_markers(history) if _supports_explicit_cache(model) else history
         messages_for_llm = [SystemMessage(content=prompt)] + history
 
         # 调用 LLM
         response = await bound_model.ainvoke(messages_for_llm)
+
+        # 最终回复时（无 tool_calls）后台分析记忆，不阻塞主循环
+        if not (getattr(response, "tool_calls", None) or []):
+            response_text = response.content if isinstance(response.content, str) else ""
+            if user_text and response_text:
+                asyncio.create_task(auto_save_memory(user_text, response_text, model))
 
         # 提取 token 用量（LangChain usage_metadata 兼容多种后端）
         usage = getattr(response, "usage_metadata", None) or {}

@@ -635,10 +635,10 @@ async def execute_tool(tool_name: str, args: dict) -> str:
     try:
         result = await handler(**args)
         # 超长结果截断（保留头尾）
-        if isinstance(result, str) and len(result) > 50000:
-            head = result[:25000]
-            tail = result[-5000:]
-            result = head + f"\n\n...[内容过长，已截断 {len(result)-30000} 字符]...\n\n" + tail
+        if isinstance(result, str) and len(result) > 10000:
+            head = result[:2500]
+            tail = result[-500:]
+            result = head + f"\n\n...[内容过长，已截断 {len(result)-3000} 字符]...\n\n" + tail
         return result
     except TypeError as e:
         return f"Error: 参数错误 — {e}"
