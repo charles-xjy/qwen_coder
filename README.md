@@ -303,28 +303,30 @@ cc-haha 共有 **5 条**压缩路径（其中 3 条在外部 build 里是 `@gene
 
 #### 三方长期记忆对比（qwen-coder / cc-haha / Reasonix）
 
-三者存储层高度同源（都是 `MEMORY.md` 索引 + 单文件 Markdown + frontmatter，上限多为 200 行/25KB），但**检索、注入、写入**三条链路是三种不同架构：
+三者存储层高度同源（都是 `MEMORY.md` 索引 + 单文件 Markdown + frontmatter，上限多为 200 行/25KB），但**检索、注入、写入**三条链路是三种不同架构。（更完整的四方对比含 CodeWhale，见 [`四项目对比_记忆系统.md`](四项目对比_记忆系统.md)。）
+
+> 注：以下 Reasonix 结论经 `deepseek-reasonix` 源码核实——它**没有 BM25、也没有专门的 memory 检索工具**，召回是"索引在前缀 + 模型用 `read_file` 按需读"，与 cc-haha 的 grep 同属模型驱动。
 
 | 维度 | 本项目（qwen-coder） | cc-haha（AutoMem） | Reasonix（DeepSeek 系） |
 |---|---|---|---|
-| 索引位置 | **不保留索引**，靠 sideQuery 预选 | `MEMORY.md` 索引常驻 system 前缀 | `MEMORY.md` 索引折进 system 前缀（启动时一次，`Block()` 纯函数渲染、空安全） |
-| 检索方式 | **独立小 LLM**（sideQuery 选 Top-5） | 主模型自己 grep/read | 主模型用 `memory` 工具 + **BM25 本地全文检索** |
+| 索引位置 | **不保留索引**，靠 sideQuery 预选 | `MEMORY.md` 索引常驻 system 前缀 | 文档全文 + `MEMORY.md` 索引折进 system 前缀（启动时一次，`Block()` 纯函数渲染、空安全） |
+| 检索方式 | **独立小 LLM**（sideQuery 选 Top-5） | 主模型自己 grep/read | 主模型用通用 `read_file` 读链接文件（**无 BM25/无专用检索工具**） |
 | 注入内容 | 选中记忆的**全文**注入消息历史 | grep 结果进 tool_result | 不主动注内容；仅在**变更**时注 `<memory-update>` delta |
-| 召回额外成本 | 每轮 1 次小 LLM 调用（决策+选取） | 主模型多一轮往返（仅需要时） | **≈0**（BM25 本地；模型按需才调工具） |
-| 写入/更新生效 | `auto_save` 后台写文件，下轮 sideQuery 才召回 | 模型用 Write 写文件 + 更新索引 | remember/forget → `pendingMemory` 队列 → 下一轮在 user 消息头注入 `<memory-update>`，系统前缀不动 |
-| 缓存代价 | 老记忆固定历史位置可缓存；新召回那轮全价 | 索引常驻前缀稳定；**写记忆那轮破前缀** | **≈0**：运行时系统前缀永不变，只有变更轮多 ~50 token，重启才折回前缀 |
+| 召回额外成本 | 每轮 1 次小 LLM 调用（决策+选取） | 主模型多一轮往返（仅需要时） | 主模型多一轮往返（仅需要时，与 cc-haha 同结构） |
+| 写入/更新生效 | `auto_save` 后台写文件，下轮 sideQuery 才召回 | 模型用 Write 写文件 + 更新索引 | `remember`/`forget` → `pendingMemory` 队列 → 下一轮在 user 消息头注入 `<memory-update>`，系统前缀不动 |
+| 缓存代价 | 老记忆固定历史位置可缓存；新召回那轮全价 | 索引常驻前缀稳定；**写记忆那轮破前缀** | **运行时系统前缀永不变**，只有变更轮多 ~50 token，重启才折回前缀 |
 | 冲突处理 | append-only，新旧并存（靠 surfaced 去重） | 模型自行判断 | 近因效应：尾部 `<memory-update>` 自然覆盖前缀里的旧索引 |
 
 **一句话定位：**
 
 - **本项目**：小 LLM 预选全文 → append-only 注入历史。召回可靠（强制每轮检索、不靠模型自觉），代价是每轮 1 次小调用 + 注入全文。
 - **cc-haha**：索引常驻前缀，主模型自己 grep。省调用，但召回靠模型自觉且占主循环往返。
-- **Reasonix**：索引常驻前缀 + BM25 本地检索 + 变更走尾部 delta。三者里**最省、缓存最稳**，代价是检索质量取决于 BM25 而非语义。
+- **Reasonix**：索引/文档折进确定性前缀 + 模型按需 `read_file` + 变更走尾部 delta。写入路径缓存最稳；召回成本结构与 cc-haha 相同（都靠主模型一轮往返）。
 
 **可借鉴的两点**（与本项目"缓存优化为核心"最契合）：
 
-1. **索引进前缀 + 内容按需取**：Reasonix 只把索引放进可缓存前缀、全文等模型真要用时才取（50 条记忆时索引 ~1500 token vs 全文注入 ~7500 token）。本项目把"该知道有哪些记忆"也外包给了 sideQuery 小模型，主模型其实看不到完整目录。
-2. **BM25 本地检索 = 召回零 LLM 成本**：本项目 sideQuery 是每轮一次 LLM 调用；可考虑「索引常驻 + 本地关键词/BM25 粗筛，命中才用小 LLM 精排」，把"每轮必有的决策调用"降成"大多数轮 0 调用"。
+1. **索引进前缀 + 内容按需取**：Reasonix/cc-haha 只把索引放进可缓存前缀、全文等模型真要用时才 `read_file`/grep（Reasonix 文档：50 条记忆时索引 ~1500 token vs 全文注入 ~7500 token）。本项目把"该知道有哪些记忆"外包给了 sideQuery 小模型，主模型其实看不到完整目录。
+2. **写记忆走尾部 delta**（Reasonix）：若未来把索引放进前缀，更新时学 Reasonix 的尾部 `<memory-update>` 注入，避免每次写记忆都破前缀缓存（cc-haha 写记忆那轮就会破前缀）。
 
 ### 六、Skills 系统
 

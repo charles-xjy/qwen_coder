@@ -1,5 +1,12 @@
 # DeepSeek-Reasonix 记忆系统完整分析
 
+> ⚠️ **更正声明（经 `deepseek-reasonix` 源码核实）**：本文部分内容不准确，阅读时请注意——
+> 1. **没有 BM25，也没有专门的 memory 检索工具（search/read/list）**。第四层「记忆检索工具 / BM25 搜索」一节描述的接口在源码中不存在。Reasonix 的实际召回方式：索引与文档记忆折进系统前缀，模型需要细节时用**通用的 `read_file`** 读对应文件（与 cc-haha 的 grep 同属"模型驱动按需读"）。
+> 2. **删除不归档到 `.archive`**。`store.Delete` 实际是 `os.Remove`，无审计日志。
+> 3. ✅ 仍然准确的部分：索引/文档启动时 `Block()` 折进前缀、`remember`/`forget` 工具写删、`pendingMemory` 队列 + 尾部 `<memory-update>` delta 注入、4 类记忆（user/feedback/project/reference）、@import 递归、路径逃逸防护。
+>
+> 准确版对比见 [`四项目对比_记忆系统.md`](四项目对比_记忆系统.md)。
+
 Reasonix 的记忆系统是一个**缓存优先、分层生效、生态兼容**的工业级设计，而不是简单的"把内容塞进 system prompt"。本文完整解析其架构。
 
 ---
