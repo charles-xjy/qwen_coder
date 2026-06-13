@@ -5,12 +5,15 @@ prompt.py - 系统 Prompt 构建
   1. 核心身份与行为规则
   2. 运行时环境（OS、shell、cwd、日期）
   3. 权限模式说明（随 state.permission_mode 动态变化）
-  4. 相关记忆（sideQuery 异步检索，按用户消息选取）
-  5. Skills 目录（可用 /command 列表）
+  4. Skills 目录（可用 /command 列表）
+
+相关记忆不再注入 system prompt，而是由 build_memory_message 以 append-only 的
+独立消息形式注入消息历史（首次召回即固定位置，后续轮次可被前缀缓存覆盖）。
 
 主入口：
-  build_system_prompt(state, model, user_message) -> str   （async）
-  build_system_prompt_sync(state) -> str                   （无记忆注入，用于非 async 场景）
+  build_system_prompt(state, model) -> str | list          （同步，带 prompt caching 缓存格式）
+  build_memory_message(state, model, user_message, recent_tools) -> (msg|None, surfaced, bytes)  （async）
+  build_system_prompt_sync(state) -> str                   （纯字符串、无缓存标记，用于子 Agent）
 """
 
 import os
@@ -19,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+from langchain_core.messages import HumanMessage
 
 from features.skills import build_skill_catalog
 from features.memory import get_memories_for_prompt, load_memory_index
@@ -201,25 +206,20 @@ def _join(*parts: str) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-# ── 主构建函数（async，含 sideQuery 记忆注入）────────────────────────────────
+# ── 主构建函数（同步，带 prompt caching 缓存格式；记忆改为 append-only 注入消息历史）──
 
-async def build_system_prompt(
-    state: AgentState,
-    model: Any,
-    user_message: str = "",
-    recent_tools: list[str] | None = None,
-) -> tuple[str | list, set, int]:
+def build_system_prompt(state: AgentState, model: Any) -> str | list:
     """
-    构建完整 system prompt。
-    返回 (prompt_content, newly_surfaced_filenames, bytes_added)。
+    构建完整 system prompt（**不含记忆**——记忆改为 append-only 注入消息历史，
+    见 build_memory_message）。
 
-    prompt_content 类型：
+    返回 prompt_content：
       - Anthropic 模型：list[dict]，稳定前缀带 cache_control ephemeral
       - 其他模型：str，稳定内容置前（利于 OpenAI/Qwen 自动前缀缓存）
 
     Section 顺序设计：
       稳定前缀（绝对不变）：identity → tool_rules
-      动态后缀（随环境/模式/轮次变化）：env → CLAUDE.md → permission → git → memories → skills
+      动态后缀（随环境/模式变化）：env → CLAUDE.md → permission → git → skills
     """
     mode = state.get("permission_mode", "default")
 
@@ -246,24 +246,6 @@ async def build_system_prompt(
     if git_ctx:
         dynamic_parts.append(git_ctx)
 
-    # sideQuery：从索引中选出相关记忆注入
-    already_surfaced: set[str] = state.get("surfaced_memories", set()) or set()
-    session_bytes: int = state.get("session_memory_bytes", 0) or 0
-
-    if user_message.strip():
-        mem_section, newly_surfaced, bytes_added = await get_memories_for_prompt(
-            query=user_message,
-            model=model,
-            already_surfaced=already_surfaced,
-            session_bytes_used=session_bytes,
-            recent_tools=recent_tools,
-        )
-        if mem_section:
-            dynamic_parts.append(mem_section)
-    else:
-        newly_surfaced = set()
-        bytes_added = 0
-
     skill_catalog = build_skill_catalog()
     if skill_catalog:
         dynamic_parts.append(skill_catalog)
@@ -282,10 +264,45 @@ async def build_system_prompt(
         ]
         if dynamic_text:
             content.append({"type": "text", "text": dynamic_text})
-        return content, newly_surfaced, bytes_added
+        return content
 
     # OpenAI / Qwen：纯字符串，稳定内容置前以利自动前缀缓存
-    return _join(stable_text, dynamic_text), newly_surfaced, bytes_added
+    return _join(stable_text, dynamic_text)
+
+
+async def build_memory_message(
+    state: AgentState,
+    model: Any,
+    user_message: str = "",
+    recent_tools: list[str] | None = None,
+):
+    """
+    sideQuery 检索相关记忆，包装成一条 append-only 记忆消息（HumanMessage）。
+
+    返回 (memory_message | None, newly_surfaced_filenames, bytes_added)。
+
+    与旧设计的区别：记忆不再每轮重拼进 system prompt 动态后缀，而是以独立消息
+    形式注入消息历史。一旦注入即固定位置、不再变动/重选，因此除首次召回那一轮
+    外，后续轮次该记忆消息都能被前缀缓存覆盖（与"缓存优化为核心"的主线一致）。
+    已注入过的记忆（state["surfaced_memories"]）不会被重复召回。
+    """
+    if not user_message.strip():
+        return None, set(), 0
+
+    already_surfaced: set[str] = state.get("surfaced_memories", set()) or set()
+    session_bytes: int = state.get("session_memory_bytes", 0) or 0
+
+    mem_section, newly_surfaced, bytes_added = await get_memories_for_prompt(
+        query=user_message,
+        model=model,
+        already_surfaced=already_surfaced,
+        session_bytes_used=session_bytes,
+        recent_tools=recent_tools,
+    )
+    if not mem_section:
+        return None, set(), 0
+
+    return HumanMessage(content=mem_section), newly_surfaced, bytes_added
 
 
 def build_system_prompt_sync(state: AgentState) -> str:

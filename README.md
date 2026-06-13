@@ -1,5 +1,7 @@
 # qwen-coder
 
+> 项目针对大模型多轮对话中重复 token 成本高、上下文溢出与跨会话记忆遗忘等问题，以 **Prompt 前缀缓存优化**为核心：将 system prompt 拆分为"绝对不变的稳定前缀"与"随环境/模式/轮次变化的动态后缀"，最大化 provider 前缀缓存命中、显著降低 input token 费用；针对"压缩必然导致前缀缓存失效"这一物理矛盾，设计**缓存对齐的四级压缩**——只在缓存本已过期的时机（空闲超 TTL）清理、并把多次小压缩批量为一次前缀重建，在化解上下文溢出的同时把缓存失效代价摊到最低；辅以跨会话文件记忆保障知识持续积累、远程沙箱确保代码安全执行。
+
 用 LangGraph 重新实现 [mini_claude](https://github.com/Windy3f3f3f3f/claude-code-from-scratch/tree/main/python) 的全部功能，作为编程 Agent 的学习与生产参考实现。
 
 ---
@@ -178,6 +180,64 @@ agent_node 调用 LLM 前：
 | **LLM snip** | 每积累 20 条消息 | LLM 判定的冗余区间 | LLM 决定区间 → `RemoveMessage` 局部折叠为 1 条摘要 |
 | **LLM 全量摘要** | 使用率 > 85% + 用户确认 | 全部历史 | `RemoveMessage` 删除全部 + 插入 1 条摘要 |
 
+#### 附：cc-haha 完整压缩流程梳理与对比
+
+本项目的 4 级压缩参考了 cc-haha（Claude Code 同源实现）的设计。为便于理解取舍，下面先完整梳理 cc-haha 的压缩流水线，再逐项对比。
+
+**cc-haha 的压缩在主循环里每轮 API 调用前按固定顺序执行（`query.ts`）：**
+
+```
+snip → microcompact → (context-collapse 投影) → autocompact ┐
+                                                  ├─ 先试 session-memory 压缩
+                                                  └─ 再走 完整 compact
+                          partial compact = 不在循环里，由用户在 UI 选消息触发
+```
+
+cc-haha 共有 **5 条**压缩路径（其中 3 条在外部 build 里是 `@generated stub`，经 DCE 不执行）：
+
+| cc-haha 路径 | 触发时机 | 压缩策略 | 是否调 LLM | 外部 build |
+|---|---|---|---|---|
+| **snip**（`HISTORY_SNIP`） | 每轮最早，先于 microcompact | 裁剪历史消息腾 token，节省量 `tokensFreed` 单独 plumb 给后续阈值判断（尾部 usage 看不见） | 否 | stub（不执行） |
+| **microcompact / time-based** | 距上条 assistant 消息 > **60min**（服务端 cache TTL=1h 必失效） | 清空旧的可压缩工具结果内容，保留最近 N 条，**改本地消息** | 否 | ✅ 但默认 flag 关 |
+| **microcompact / cached** | **计数触发**：活跃可压缩工具结果**个数** > `triggerThreshold` | 按 `tool_use_id` 走 **cache-editing API** 在服务端删结果，**不改本地**，靠 `pinnedEdits` 复发位置 | 否 | stub（不执行） |
+| **session-memory 压缩**（实验） | 达 autocompact 阈值时**优先**尝试 | **复用后台早已抽取好的 memory 文件当摘要**，保留 `lastSummarizedMessageId` 之后的消息（向前扩到 minTokens=10K/5 条文本，封顶 40K） | 否（摘要平时后台攒） | 需 `tengu_session_memory`+`tengu_sm_compact` 双 flag，默认关 |
+| **完整 compact**（`compactConversation`） | 自动达阈值（有效窗口 − 13K）**或** 手动 `/compact` | forked-agent 共享 prompt cache 做总结 → 9 段式摘要 → **全替换** → 重注入最近读过的文件(≤5)/plan/skill/tools/MCP delta；带 PTL 重试 + 连续失败 3 次熔断 | **是** | ✅ 默认主路径 |
+| **partial compact** | **用户手动**选一条枢轴消息 | `from`=总结枢轴之后保留之前；`up_to`=总结之前保留之后。只压一半，另一半逐字保留，用 `preservedSegment{head,anchor,tail}` 修补磁盘链路 | **是** | ✅ |
+
+**关于 session-memory 的关键点（容易误解）**：它的摘要**不是压缩那一刻生成的**，而是会话过程中由 post-sampling hook（`extractSessionMemory`）**后台分期抽取**写进磁盘文件——满足"token 增量 + 工具调用数"双门槛时，开一个 forked subagent 增量更新 memory 文件并记下 `lastSummarizedMessageId`。压缩时直接把这份现成笔记读出来顶替，省掉一次总结 API 调用。但它是**优先级**而非替代关系：memory 没攒够、是空模板、边界对不上、或压完仍超阈值，都会 `return null` **回落到完整 compact**——所以完整 compact 永远是兜底，不会变成死代码。
+
+**易混淆点澄清（速记版）**：下面是 cc-haha 5 层的精简心智模型，特别标注三个最常见的误解：
+
+| # | 机制 | 干什么 | 调 LLM？ |
+|---|---|---|---|
+| 1 | snip | 裁历史消息腾 token | 否 |
+| 2a | mic time-based（空闲 > 1h） | **清空**旧工具结果内容、保留最近 5（非删消息） | 否 |
+| 2b | mic cached（活跃工具数超阈值） | **cache-editing API 删旧工具结果**（⚠️**不是总结对话**） | 否 |
+| 3 | session-memory（达阈值优先） | **复用后台攒好的笔记当摘要**（与 2b 无关，是另一条独立路径） | 否（后台早已攒） |
+| 4 | 完整 compact（兜底 / 手动 `/compact`） | 现场全量总结 + 全替换 + 重注入 | 是 |
+| 5 | partial compact（**用户手动**选枢轴） | 总结一半、保留一半 | 是 |
+
+三个易错点：
+1. **2b 不总结**：cached microcompact 只是用 cache-editing 删旧工具结果以保护缓存前缀，全程不调 LLM、不产生摘要。
+2. **完整压缩的快通道是 session-memory（#3），不是 2b**：两者毫无关系——2b 删工具结果，session-memory 复用后台笔记当摘要。
+3. **cc-haha 没有"自动判冗余折叠"**：能"折叠一段保留其余"的 partial compact 是**用户手动**选区间。本项目的级别 3（自动 LLM snip：自动触发 + LLM 自主决定冗余区间）是 qwen-coder 在这一层比 cc-haha 多做的。
+
+**逐项对比：**
+
+| 维度 | 本项目（qwen-coder） | cc-haha |
+|---|---|---|
+| 级别 1 / 预算截断 | 单工具结果 > 10000 字符头尾截断，对 Agent 透明 | 无单独"截断级"，靠 FileRead token 上限 + 工具结果存储 |
+| 级别 2 / time-based mic | 空闲 > **5min**（Qwen 缓存 TTL=5min），清旧工具结果，保留 5 条，改本地副本 | 空闲 > **60min**（服务端 TTL=1h），逻辑基本一致；阈值差异源于两边缓存 TTL 不同 |
+| 级别 3 / LLM snip | **每积累 20 条消息**自动触发，**让 LLM 自己判定冗余区间 [start,end]** 折叠为 1 条摘要，其余原封不动，最近 6 条永不压 | snip 仅腾 token（stub）；"折叠一段保留其余"对应的是 **partial compact，但它是用户手动选区间**。本项目把它做成了**自动 + LLM 决策区间**，更激进 |
+| 级别 4 / 全量摘要 | 使用率 **> 75% interrupt 问用户**，> 85% + 确认才全量摘要；9 段式 prompt 对齐 cc-haha | 达阈值（有效窗口 − 13K）**自动压缩、不询问**；同样 9 段式、含 `<analysis>` 草稿 |
+| 触发度量 | 上下文**使用率比例**（60/75/85%）+ 消息计数 | 多为**绝对 token 阈值**（窗口 − 固定 buffer） |
+| Prompt cache 保护 | time-based mic 减少重写；未做 forked-agent 缓存共享 / cache-editing | 重度优化：forked-agent 共享前缀缓存、cache-editing API、缓存断裂检测 |
+| 后台增量摘要 | **无**：`memory.py` 是跨会话**文件记忆 + sideQuery 检索**，不用作压缩摘要 | session-memory 把"后台攒摘要"直接用作压缩快通道 |
+| 压缩后重注入 | 无，模型按需 `read_file` 重读 | 重注入文件/plan/skill/tools/MCP |
+| 健壮性 | snip/摘要失败则原样返回 | PTL 自动截头重试、连续失败熔断、递归防护 |
+
+**总体差异**：本项目走"**比例阈值 + 用户可介入 + LLM 自主决定折叠区间**"的轻量路线，把 cc-haha 里"手动 partial"升级成了"自动 LLM snip"，但省略了 cc-haha 围绕 prompt cache 的大量工程（forked-agent 缓存共享、cache-editing、后台增量 session-memory、压缩后重注入、PTL 重试与熔断）。cc-haha 更偏"省钱省 cache、全自动、强兜底"，本项目更偏"简单可控、关键处让用户确认"。
+
 ### 五、文件记忆系统
 
 - 存储路径：`.memory/`（项目级，随代码库版本控制）
@@ -191,7 +251,7 @@ agent_node 调用 LLM 前：
 
 | 调用 | 时机 | 方式 | 说明 |
 |------|------|------|------|
-| sideQuery（检索） | 主 LLM 调用前 | 串行 await | 将 MEMORY.md 索引发给 LLM，选出最相关的 ≤5 条注入 system prompt |
+| sideQuery（检索） | 主 LLM 调用前 | 串行 await | 将 MEMORY.md 索引发给 LLM，选出最相关的 ≤5 条，包装成一条独立消息 **append 进消息历史**（见下「记忆注入：append-only」） |
 | auto_save_memory（写入） | 主 LLM 最终回复后 | `asyncio.create_task` fire-and-forget | 分析本轮对话，判断是否有值得长期保存的内容，有则直接写文件 |
 
 **sideQuery 优化：**
@@ -214,6 +274,57 @@ agent_node 调用 LLM 前：
 | 会话数 | ≥ 5 次 | 上次整合后累计的会话数 |
 
 状态持久化在 `.memory/.dream_state.json`，互斥锁防止并发，整合完成后重置计数器。不满足门槛时立即返回，不阻塞退出。
+
+**记忆注入：append-only（缓存友好）**
+
+召回的记忆**不放进 system prompt**，而是由 `build_memory_message` 包装成一条独立的 `HumanMessage`，**append 到消息历史末尾**。一旦注入即固定位置、之后不再变动/重选——因此除首次召回那一轮外，该记忆消息在后续轮次都能被前缀缓存覆盖。
+
+```
+持久化在 state 里的消息历史（system 不入 state，每轮临时前置）：
+  human1
+  memory1     ← 本轮 sideQuery 召回到的新记忆，紧跟 human1 后
+  ai1
+  human2      ← 本轮无新记忆，则不插
+  ai2
+  human3
+  memory3     ← 本轮又召回到新的
+  ai3
+
+实际发给 LLM：[SystemMessage(prompt)] + 上面这串历史
+```
+
+设计要点：
+
+- **为什么不放 system prompt**：旧设计每轮按 query 重选一组记忆拼进 system 动态后缀，内容每轮都变 → 这段永远是全价 input、进不了缓存。改为 append-only 后，记忆消息位置固定，老记忆走缓存，只有"本轮新召回的那条"是全价——与「缓存优化为核心」的主线一致。
+- **不会重复注入**：`surfaced_memories` 记录已召回的文件名，下轮不再选；同一用户回合内的多步工具循环也只注入一次。
+- **memory 不是每轮都有**：只有 sideQuery 返回了**新**记忆的轮次才插一条；返回 `[]` 的轮次没有 memory 消息。
+- **累积量兜底**：append-only 下记忆只进不出（不会因话题切换撤下旧记忆），靠单会话注入上限 `_MAX_SESSION_BYTES=60KB` 封顶。
+- **与 cc-haha 的差异**：cc-haha 的召回结果落在 tool_result（模型自己 grep），本项目落在主动注入的 `HumanMessage`；两者都不污染稳定前缀。
+
+#### 三方长期记忆对比（qwen-coder / cc-haha / Reasonix）
+
+三者存储层高度同源（都是 `MEMORY.md` 索引 + 单文件 Markdown + frontmatter，上限多为 200 行/25KB），但**检索、注入、写入**三条链路是三种不同架构：
+
+| 维度 | 本项目（qwen-coder） | cc-haha（AutoMem） | Reasonix（DeepSeek 系） |
+|---|---|---|---|
+| 索引位置 | **不保留索引**，靠 sideQuery 预选 | `MEMORY.md` 索引常驻 system 前缀 | `MEMORY.md` 索引折进 system 前缀（启动时一次，`Block()` 纯函数渲染、空安全） |
+| 检索方式 | **独立小 LLM**（sideQuery 选 Top-5） | 主模型自己 grep/read | 主模型用 `memory` 工具 + **BM25 本地全文检索** |
+| 注入内容 | 选中记忆的**全文**注入消息历史 | grep 结果进 tool_result | 不主动注内容；仅在**变更**时注 `<memory-update>` delta |
+| 召回额外成本 | 每轮 1 次小 LLM 调用（决策+选取） | 主模型多一轮往返（仅需要时） | **≈0**（BM25 本地；模型按需才调工具） |
+| 写入/更新生效 | `auto_save` 后台写文件，下轮 sideQuery 才召回 | 模型用 Write 写文件 + 更新索引 | remember/forget → `pendingMemory` 队列 → 下一轮在 user 消息头注入 `<memory-update>`，系统前缀不动 |
+| 缓存代价 | 老记忆固定历史位置可缓存；新召回那轮全价 | 索引常驻前缀稳定；**写记忆那轮破前缀** | **≈0**：运行时系统前缀永不变，只有变更轮多 ~50 token，重启才折回前缀 |
+| 冲突处理 | append-only，新旧并存（靠 surfaced 去重） | 模型自行判断 | 近因效应：尾部 `<memory-update>` 自然覆盖前缀里的旧索引 |
+
+**一句话定位：**
+
+- **本项目**：小 LLM 预选全文 → append-only 注入历史。召回可靠（强制每轮检索、不靠模型自觉），代价是每轮 1 次小调用 + 注入全文。
+- **cc-haha**：索引常驻前缀，主模型自己 grep。省调用，但召回靠模型自觉且占主循环往返。
+- **Reasonix**：索引常驻前缀 + BM25 本地检索 + 变更走尾部 delta。三者里**最省、缓存最稳**，代价是检索质量取决于 BM25 而非语义。
+
+**可借鉴的两点**（与本项目"缓存优化为核心"最契合）：
+
+1. **索引进前缀 + 内容按需取**：Reasonix 只把索引放进可缓存前缀、全文等模型真要用时才取（50 条记忆时索引 ~1500 token vs 全文注入 ~7500 token）。本项目把"该知道有哪些记忆"也外包给了 sideQuery 小模型，主模型其实看不到完整目录。
+2. **BM25 本地检索 = 召回零 LLM 成本**：本项目 sideQuery 是每轮一次 LLM 调用；可考虑「索引常驻 + 本地关键词/BM25 粗筛，命中才用小 LLM 精排」，把"每轮必有的决策调用"降成"大多数轮 0 调用"。
 
 ### 六、Skills 系统
 
@@ -347,9 +458,10 @@ system prompt 每轮都会重建，只有真正不变的内容才放入稳定前
   _TOOL_RULES                           CLAUDE.md（agent 可能编辑它）
                                         permission section（进入/退出 plan 会变化）
                                         git context
-                                        memories（sideQuery 每轮结果）
                                         skills catalog
 ```
+
+> 注：相关记忆**不再放进 system prompt**（旧设计曾置于动态后缀），改为 append-only 注入消息历史，详见「五、文件记忆系统 → 记忆注入：append-only」。
 
 稳定区只保留两个硬编码常量，env / CLAUDE.md / permission 虽然大部分时间不变，但 cwd 切换、agent 编辑 CLAUDE.md、进入 plan 模式都会导致变化，放入稳定区会导致缓存频繁失效。移到动态区后，缓存只在 _IDENTITY 或 _TOOL_RULES 代码变更时才失效，命中率大幅提升。
 

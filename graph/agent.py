@@ -38,7 +38,7 @@ from graph.compressor import (
 )
 from langchain_core.messages import RemoveMessage
 from features.memory import auto_save_memory
-from graph.prompt import build_system_prompt
+from graph.prompt import build_system_prompt, build_memory_message
 from core.state import AgentState
 from graph.subagent import handle_agent_tool
 from core.tools import check_permission, execute_tool, get_active_tool_definitions
@@ -158,12 +158,10 @@ def build_graph(model: Any, max_turns: int = 100):
         lc_tools = _to_lc_tools(tool_schemas)
         bound_model = model.bind_tools(lc_tools) if lc_tools else model
 
-        # 构建 system prompt（sideQuery 选出相关记忆注入）
+        # 构建 system prompt（不含记忆；记忆改为 append-only 注入消息历史）
         user_text = _last_human_text(state["messages"])
         recent_tools = _recent_tool_names(state["messages"])
-        prompt, newly_surfaced, bytes_added = await build_system_prompt(
-            state, model, user_text, recent_tools
-        )
+        prompt = build_system_prompt(state, model)
 
         # system message 不进 state，只在调用时临时拼接
         from graph.prompt import _supports_explicit_cache
@@ -190,6 +188,14 @@ def build_graph(model: Any, max_turns: int = 100):
             # 无论是否实际压缩，都重置计数器（避免无冗余时每轮都检查）
             snip_extra = {"messages_at_last_snip": non_system_count}
 
+        # ── 记忆召回（append-only）：sideQuery 选出相关记忆，作为一条独立消息追加进
+        # 历史末尾。首次召回即固定位置、后续轮次不再变动/重选 → 能被前缀缓存覆盖。
+        mem_msg, newly_surfaced, bytes_added = await build_memory_message(
+            state, model, user_text, recent_tools
+        )
+        if mem_msg is not None:
+            history = history + [mem_msg]
+
         history = _apply_history_cache_markers(history) if _supports_explicit_cache(model) else history
         messages_for_llm = [SystemMessage(content=prompt)] + history
 
@@ -207,8 +213,15 @@ def build_graph(model: Any, max_turns: int = 100):
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
 
+        # mem_msg 也要写回 state，使其固定留在历史中（append-only），
+        # 后续轮次位置不变 → 可被前缀缓存覆盖。顺序：召回记忆在本轮回复之前。
+        new_messages = snip_removes
+        if mem_msg is not None:
+            new_messages = new_messages + [mem_msg]
+        new_messages = new_messages + [response]
+
         return {
-            "messages": snip_removes + [response],
+            "messages": new_messages,
             "current_turns": turns + 1,
             "last_api_call_time": time.time(),
             "last_input_token_count": input_tokens,
