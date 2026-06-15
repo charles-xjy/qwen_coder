@@ -105,6 +105,24 @@ def _memory_age_days(mtime: float) -> float:
     return (time.time() - mtime) / 86400
 
 
+def _relative_time(mtime: float) -> str:
+    """把 mtime 转成精确到分钟级的相对时间，用于冲突时按新旧裁决。
+
+    与 _freshness_warning 不同：后者只在超过 1 天后才出现，无法区分同一
+    会话内几分钟差距的两条记忆；本函数任何时刻都给出可比较的相对时间。
+    """
+    secs = max(0.0, time.time() - mtime)
+    if secs < 60:
+        return "刚刚"
+    mins = secs / 60
+    if mins < 60:
+        return f"{mins:.0f} 分钟前"
+    hours = mins / 60
+    if hours < 24:
+        return f"{hours:.0f} 小时前"
+    return f"{hours / 24:.0f} 天前"
+
+
 def _freshness_warning(mtime: float) -> str:
     days = _memory_age_days(mtime)
     if days < _FRESHNESS_DAYS:
@@ -261,10 +279,14 @@ async def select_relevant_memories(
     if not headers:
         return []
 
-    # 构建 manifest（只含文件名和描述，不含内容）
+    # 构建 manifest（只含文件名、描述、类型、相对时间，不含内容）
+    # 带上相对时间，便于 LLM 在描述相近/冲突时把新旧两条都选出来交主模型裁决
     manifest_lines = []
     for h in headers:
-        manifest_lines.append(f"- {h.filename}: {h.description} [类型: {h.type}]")
+        rel = _relative_time(h.mtime_ms / 1000)
+        manifest_lines.append(
+            f"- {h.filename}: {h.description} [类型: {h.type}, 记录于: {rel}]"
+        )
     manifest = "\n".join(manifest_lines)
 
     # recentTools 过滤说明
@@ -281,6 +303,8 @@ async def select_relevant_memories(
         f"{recent_tools_section}\n"
         f"可用记忆列表：\n{manifest}\n\n"
         f"从上述列表中选出最相关的记忆文件名（最多 {_SIDE_QUERY_TOP_K} 个）。\n"
+        "注意：若有多条记忆描述同一主题但可能相互冲突（如先后记录的偏好不同），"
+        "请把它们**全部**选出（连同较旧的一条），交由主模型结合时间戳裁决，不要只选其一。\n"
         '只返回 JSON，不加任何解释，格式：{"selected": ["filename1.md", "filename2.md"]}\n'
         '没有相关记忆则返回：{"selected": []}'
     )
@@ -316,8 +340,12 @@ async def select_relevant_memories(
             if len(body_bytes) > _MAX_FILE_BYTES:
                 body = body_bytes[:_MAX_FILE_BYTES].decode(errors="replace") + "\n...(截断)"
 
+            rel = _relative_time(header.mtime_ms / 1000)
             warn = _freshness_warning(header.mtime_ms / 1000)
-            header_text = f"### 记忆：{header.name}（{header.type}）{' ' + warn if warn else ''}"
+            header_text = (
+                f"### 记忆：{header.name}（{header.type}，记录于 {rel}）"
+                f"{' ' + warn if warn else ''}"
+            )
 
             results.append(RelevantMemory(
                 path=header.path,
@@ -356,7 +384,11 @@ async def get_memories_for_prompt(
     if not memories:
         return "", set(), 0
 
-    sections: list[str] = ["## 相关记忆\n"]
+    sections: list[str] = [
+        "## 相关记忆\n",
+        "（每条记忆标注了记录时间。若两条记忆就同一事项相互冲突，"
+        "以记录时间较新的为准；若内容互补、并不矛盾，则同时采纳，不要因为旧而丢弃。）\n",
+    ]
     newly_surfaced: set[str] = set()
     bytes_added = 0
 
@@ -372,7 +404,7 @@ async def get_memories_for_prompt(
         newly_surfaced.add(mem.path.name)
         bytes_added += block_bytes
 
-    if len(sections) == 1:  # 只有标题，没有内容
+    if not newly_surfaced:  # 标题/说明之外没有实际记忆内容
         return "", set(), 0
 
     return "".join(sections), newly_surfaced, bytes_added
